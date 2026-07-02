@@ -93,8 +93,13 @@ export function inferPdfMetaFromFileName(fileName: string) {
     .join("-")
     .concat(".pdf");
 
+  const shipmentTitle = [shipmentName, warehouseCode, fbaCode, totalBoxes ? `${totalBoxes}箱` : "", channelName]
+    .filter(Boolean)
+    .join("-");
+
   return {
     fileNameBase: baseName,
+    shipmentTitle,
     shipmentName,
     warehouseCode,
     fbaCode,

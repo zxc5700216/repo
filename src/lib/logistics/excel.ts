@@ -1,10 +1,12 @@
 import * as XLSX from "xlsx";
+import JSZip from "jszip";
 import type {
   AProductRow,
   AWorkbookSummary,
   BWorkbookSummary,
   CWorkbookSummary,
   DWorkbookSummary,
+  NamedWorkbookExportResult,
   PdfSummary,
   WorkbookExportResult,
 } from "@/lib/logistics/types";
@@ -27,6 +29,82 @@ function getSheetMatrix(sheet: XLSX.WorkSheet) {
     raw: false,
     defval: null,
   });
+}
+
+function columnNumberToName(column: number) {
+  let current = column;
+  let name = "";
+
+  while (current > 0) {
+    const remainder = (current - 1) % 26;
+    name = String.fromCharCode(65 + remainder) + name;
+    current = Math.floor((current - 1) / 26);
+  }
+
+  return name;
+}
+
+function buildCellRef(row: number, col: number) {
+  return `${columnNumberToName(col)}${row}`;
+}
+
+function upsertNumericCell(sheetXml: string, cellRef: string, value: number) {
+  const rowNumber = Number(cellRef.replace(/^[A-Z]+/u, ""));
+  const cellRegex = new RegExp(`(<c[^>]*r="${cellRef}"[^>]*>)([\\s\\S]*?)(</c>)`, "u");
+
+  if (cellRegex.test(sheetXml)) {
+    return sheetXml.replace(cellRegex, (_match, startTag, innerXml, endTag) => {
+      if (/<v>[\s\S]*?<\/v>/u.test(innerXml)) {
+        return `${startTag}${innerXml.replace(/<v>[\s\S]*?<\/v>/u, `<v>${value}</v>`)}${endTag}`;
+      }
+
+      if (/<f>[\s\S]*?<\/f>/u.test(innerXml)) {
+        return `${startTag}${innerXml}<v>${value}</v>${endTag}`;
+      }
+
+      return `${startTag}<v>${value}</v>${endTag}`;
+    });
+  }
+
+  const rowRegex = new RegExp(`(<row[^>]*r="${rowNumber}"[^>]*>)([\\s\\S]*?)(</row>)`, "u");
+  if (rowRegex.test(sheetXml)) {
+    return sheetXml.replace(rowRegex, (_match, startTag, innerXml, endTag) => `${startTag}${innerXml}<c r="${cellRef}"><v>${value}</v></c>${endTag}`);
+  }
+
+  return sheetXml;
+}
+
+function parseBoxHeader(value: unknown) {
+  const text = toText(value);
+  const matched = text.match(/第?\s*(\d+)\s*箱?/u);
+  if (!matched) {
+    return null;
+  }
+
+  const parsed = Number(matched[1]);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function findPackageCount(matrix: (string | number | null)[][]) {
+  const rowIndex = matrix.findIndex((row) => row.some((cell) => toText(cell).includes("包装箱总数")));
+  if (rowIndex < 0) {
+    return null;
+  }
+
+  const row = matrix[rowIndex] ?? [];
+  const labelIndex = row.findIndex((cell) => toText(cell).includes("包装箱总数"));
+  if (labelIndex < 0) {
+    return null;
+  }
+
+  for (let index = labelIndex + 1; index < row.length; index += 1) {
+    const parsed = parseNumber(row[index]);
+    if (parsed !== null) {
+      return parsed;
+    }
+  }
+
+  return null;
 }
 
 export async function parseAWorkbook(file: File): Promise<AWorkbookSummary> {
@@ -81,15 +159,20 @@ export async function parseAWorkbook(file: File): Promise<AWorkbookSummary> {
     });
   }
 
+  const inlineMetricRow = (matrix[1] ?? []) as (string | number | null)[];
   const boxWeightRow = matrix.find((row) => toText(row[4]).toLowerCase() === "weight of box (kg)");
   const boxLengthRow = matrix.find((row) => toText(row[4]).toLowerCase() === "box length (cm)");
   const boxWidthRow = matrix.find((row) => toText(row[4]).toLowerCase() === "box width (cm)");
   const boxHeightRow = matrix.find((row) => toText(row[4]).toLowerCase() === "box height (cm)");
 
-  const mapBoxMetric = (metricRow?: (string | number | null)[]) =>
+  const mapBoxMetric = (metricRow?: (string | number | null)[], inlineStartIndex?: number) =>
     Object.fromEntries(
       boxHeaders.map((boxNo, offset) => {
-        const value = parseNumber(metricRow?.[24 + offset]) ?? parseNumber(metricRow?.[7 + boxNo - 1]) ?? 0;
+        const value =
+          parseNumber(metricRow?.[24 + offset]) ??
+          (inlineStartIndex !== undefined ? parseNumber(inlineMetricRow[inlineStartIndex + offset]) : null) ??
+          parseNumber(metricRow?.[7 + boxNo - 1]) ??
+          0;
         return [boxNo, value];
       }),
     ) as Record<number, number>;
@@ -100,7 +183,7 @@ export async function parseAWorkbook(file: File): Promise<AWorkbookSummary> {
     totalBoxes: boxHeaders.length,
     totalShipment: rows.reduce((sum, row) => sum + row.totalShipment, 0),
     boxHeaders,
-    boxWeightKgMap: mapBoxMetric(boxWeightRow),
+    boxWeightKgMap: mapBoxMetric(boxWeightRow, 24),
     boxLengthCmMap: mapBoxMetric(boxLengthRow),
     boxWidthCmMap: mapBoxMetric(boxWidthRow),
     boxHeightCmMap: mapBoxMetric(boxHeightRow),
@@ -122,7 +205,11 @@ export async function parseBWorkbook(file: File): Promise<BWorkbookSummary> {
 
 export async function parseCWorkbook(file: File): Promise<CWorkbookSummary> {
   const { workbook } = await readWorkbook(file);
-  const sheetName = workbook.SheetNames.find((name) => name === "Pack List") ?? workbook.SheetNames[0] ?? "";
+  const sheetName =
+    workbook.SheetNames.find((name) => name === "Pack List") ??
+    workbook.SheetNames.find((name) => name === "包装箱包装信息") ??
+    workbook.SheetNames[0] ??
+    "";
 
   if (!sheetName) {
     throw new Error("C表没有可读取的 sheet");
@@ -130,15 +217,27 @@ export async function parseCWorkbook(file: File): Promise<CWorkbookSummary> {
 
   const sheet = workbook.Sheets[sheetName];
   const matrix = getSheetMatrix(sheet);
-  const headerRow = matrix[1] ?? [];
-  const boxHeaders = headerRow
-    .map((value, index) => ({ boxNo: parseNumber(toText(value).replace("第", "").replace("箱", "")), index }))
-    .filter((item) => item.index >= 7 && item.boxNo !== null)
+  const headerRowIndex = matrix.findIndex((row) => row.some((cell) => toText(cell) === "SKU" || toText(cell) === "第1箱" || toText(cell) === "第 1 箱"));
+  const headerRow = headerRowIndex >= 0 ? matrix[headerRowIndex] ?? [] : matrix[1] ?? [];
+  const detectedBoxHeaders = headerRow
+    .map((value, index) => ({ boxNo: parseBoxHeader(value), index }))
+    .filter((item) => item.index >= 0 && item.boxNo !== null)
     .map((item) => item.boxNo as number);
 
+  const packageCount = findPackageCount(matrix);
+
+  const isNewAmazonPackSheet = sheetName === "包装箱包装信息";
+  const boxHeaders =
+    isNewAmazonPackSheet && packageCount && packageCount > 0
+      ? Array.from({ length: packageCount }, (_, index) => index + 1)
+      : detectedBoxHeaders;
+
   const skuRows = matrix
-    .slice(2)
-    .map((row) => toText(row[4]))
+    .slice(Math.max(headerRowIndex + 1, 0))
+    .map((row) => {
+      const skuIndex = headerRow.findIndex((cell) => toText(cell) === "SKU");
+      return toText(row[skuIndex >= 0 ? skuIndex : 4]);
+    })
     .filter(Boolean);
 
   return {
@@ -191,50 +290,110 @@ export async function buildBWorkbook(file: File, aSummary: AWorkbookSummary): Pr
 
 export async function buildCWorkbook(file: File, aSummary: AWorkbookSummary): Promise<WorkbookExportResult> {
   const buffer = await file.arrayBuffer();
-  const workbook = XLSX.read(buffer, { type: "array" });
-  const sheet = workbook.Sheets["Pack List"];
+  const xlsxWorkbook = XLSX.read(buffer, { type: "array", cellDates: true, cellHTML: false, cellFormula: true });
+  const sheetName =
+    xlsxWorkbook.SheetNames.find((name) => name === "Pack List") ??
+    xlsxWorkbook.SheetNames.find((name) => name === "包装箱包装信息");
 
-  if (!sheet) {
-    throw new Error("C表缺少 Pack List");
+  if (!sheetName) {
+    throw new Error("C表缺少 Pack List 或 包装箱包装信息");
   }
 
+  const sheet = xlsxWorkbook.Sheets[sheetName];
   const matrix = getSheetMatrix(sheet);
-  const skuRowIndexMap = new Map<string, number>();
+  const headerRowIndex = matrix.findIndex((row) => row.some((cell) => toText(cell) === "SKU" || toText(cell) === "第1箱" || toText(cell) === "第 1 箱"));
+  const headerRow = headerRowIndex >= 0 ? matrix[headerRowIndex] ?? [] : matrix[1] ?? [];
+  const skuColIndex = headerRow.findIndex((cell) => toText(cell) === "SKU");
+  const boxColIndexMap = new Map<number, number>();
+  const isNewAmazonPackSheet = sheetName === "包装箱包装信息";
+
+  if (isNewAmazonPackSheet) {
+    const packageCount = findPackageCount(matrix);
+
+    if (!packageCount || packageCount <= 0) {
+      throw new Error("新版 C 表未识别到包装箱总数");
+    }
+
+    for (let boxNo = 1; boxNo <= packageCount; boxNo += 1) {
+      boxColIndexMap.set(boxNo, 13 + boxNo - 1);
+    }
+  } else {
+    headerRow.forEach((cell, index) => {
+      const boxNo = parseBoxHeader(cell);
+      if (boxNo !== null) {
+        boxColIndexMap.set(boxNo, index + 1);
+      }
+    });
+  }
+
+  const skuRowNumberMap = new Map<string, number>();
 
   matrix.forEach((row, index) => {
-    const sku = toText(row[4]);
+    const sku = toText(row[skuColIndex >= 0 ? skuColIndex : 4]);
     if (sku) {
-      skuRowIndexMap.set(sku, index);
+      skuRowNumberMap.set(sku, index + 1);
     }
   });
 
+  const metricRowMap = {
+    weight: matrix.findIndex((row) => row.some((cell) => toText(cell).includes("包装箱重量") || toText(cell).toLowerCase() === "weight of box (kg)")) + 1,
+    width: matrix.findIndex((row) => row.some((cell) => toText(cell).includes("包装箱宽度") || toText(cell).toLowerCase() === "box width (cm)")) + 1,
+    length: matrix.findIndex((row) => row.some((cell) => toText(cell).includes("包装箱长度") || toText(cell).toLowerCase() === "box length (cm)")) + 1,
+    height: matrix.findIndex((row) => row.some((cell) => toText(cell).includes("包装箱高度") || toText(cell).toLowerCase() === "box height (cm)")) + 1,
+  };
+  const zip = await JSZip.loadAsync(buffer);
+  const targetSheetPath = sheetName === "包装箱包装信息" ? "xl/worksheets/sheet2.xml" : "xl/worksheets/sheet1.xml";
+  const originalSheetXml = await zip.file(targetSheetPath)?.async("string");
+
+  if (!originalSheetXml) {
+    throw new Error("未找到 C 表对应的 worksheet xml");
+  }
+
+  let patchedSheetXml = originalSheetXml;
+
   aSummary.rows.forEach((product) => {
-    const sheetRowIndex = skuRowIndexMap.get(product.sku);
-    if (sheetRowIndex === undefined) {
+    const sheetRowNumber = skuRowNumberMap.get(product.sku);
+    if (sheetRowNumber === undefined) {
       return;
     }
 
     for (const [boxNoText, qty] of Object.entries(product.boxMap)) {
       const boxNo = Number(boxNoText);
-      const colIndex = 6 + boxNo;
-      XLSX.utils.sheet_add_aoa(sheet, [[qty]], { origin: { r: sheetRowIndex, c: colIndex } });
+      const colIndex = boxColIndexMap.get(boxNo);
+      if (colIndex === undefined) {
+        continue;
+      }
+      patchedSheetXml = upsertNumericCell(patchedSheetXml, buildCellRef(sheetRowNumber, colIndex), qty);
     }
   });
 
   aSummary.boxHeaders.forEach((boxNo) => {
-    const weightLb = Number(((aSummary.boxWeightKgMap[boxNo] ?? 0) / 0.454).toFixed(2));
-    const colIndex = 6 + boxNo;
-    XLSX.utils.sheet_add_aoa(sheet, [[weightLb]], { origin: { r: 14, c: colIndex } });
-    XLSX.utils.sheet_add_aoa(sheet, [[17]], { origin: { r: 15, c: colIndex } });
-    XLSX.utils.sheet_add_aoa(sheet, [[18]], { origin: { r: 16, c: colIndex } });
-    XLSX.utils.sheet_add_aoa(sheet, [[16]], { origin: { r: 17, c: colIndex } });
+    const colIndex = boxColIndexMap.get(boxNo);
+    if (colIndex === undefined) {
+      return;
+    }
+    if (metricRowMap.weight > 0) {
+      const weightLb = Math.round((aSummary.boxWeightKgMap[boxNo] ?? 0) / 0.454);
+      patchedSheetXml = upsertNumericCell(patchedSheetXml, buildCellRef(metricRowMap.weight, colIndex), weightLb);
+    }
+    if (metricRowMap.width > 0) {
+      patchedSheetXml = upsertNumericCell(patchedSheetXml, buildCellRef(metricRowMap.width, colIndex), 18);
+    }
+    if (metricRowMap.length > 0) {
+      patchedSheetXml = upsertNumericCell(patchedSheetXml, buildCellRef(metricRowMap.length, colIndex), 17);
+    }
+    if (metricRowMap.height > 0) {
+      patchedSheetXml = upsertNumericCell(patchedSheetXml, buildCellRef(metricRowMap.height, colIndex), 16);
+    }
   });
 
-  const output = XLSX.write(workbook, { type: "array", bookType: "xlsx" });
+  zip.file(targetSheetPath, patchedSheetXml);
+  const output = await zip.generateAsync({ type: "uint8array" });
+  const outputBytes = Array.from(output);
 
   return {
-    fileName: `C_已填写_${Date.now()}.xlsx`,
-    blob: new Blob([output], {
+    fileName: file.name,
+    blob: new Blob([new Uint8Array(outputBytes)], {
       type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     }),
   };
@@ -285,4 +444,151 @@ export async function buildSummaryWorkbook(aSummary: AWorkbookSummary, pdfSummar
       type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     }),
   };
+}
+
+function inferEnglishName(productName: string, sku: string) {
+  const samples: Record<string, string> = {
+    "0E-7MD5-T78E": "Sand Bag",
+    "PP-4VL0-SDK2": "Softball Sleeve Holders",
+    "LJ-98F8-THD5": "Soccer Armband",
+    "U3-UBDP-WLQY": "Softball Sleeve Holders",
+    "5J-APYY-A5SU": "Golf Cart Flag",
+    "9M-JWM6-20L1": "Sand Bag",
+    "KA-USA Flag": "Golf Cart Flag",
+    "KA-pickleball court": "Pickleball Court Marking Kit",
+    "B8-FISN-297Q": "Diving Flag Mount",
+    "KA-Handicap Flag": "Golf Cart Flag",
+    "T-SANDBAG-BLK-L": "Sand Bag",
+  };
+
+  if (samples[sku]) {
+    return samples[sku];
+  }
+
+  return productName || "";
+}
+
+function buildDLinesForPdf(aSummary: AWorkbookSummary, pdfSummary: PdfSummary) {
+  const lines: Array<{
+    boxNo: number;
+    fbaBoxCode: string;
+    weightKg: number;
+    hsCode: string;
+    productNameCn: string;
+    productNameEn: string;
+    qtyPerBox: number;
+    declarePrice: number | "";
+    image: string;
+  }> = [];
+
+  pdfSummary.pages.forEach((page, pageIndex) => {
+    const boxNo = page.pageNumber;
+    const weightKg = aSummary.boxWeightKgMap[boxNo] ?? 0;
+
+    const matchedProducts = aSummary.rows.filter((row) => (row.boxMap[boxNo] ?? 0) > 0);
+
+    if (!matchedProducts.length) {
+      lines.push({
+        boxNo,
+        fbaBoxCode: page.fbaBoxCode,
+        weightKg,
+        hsCode: "",
+        productNameCn: "",
+        productNameEn: "",
+        qtyPerBox: page.qty ?? 0,
+        declarePrice: "",
+        image: "",
+      });
+      return;
+    }
+
+    matchedProducts.forEach((product) => {
+      lines.push({
+        boxNo,
+        fbaBoxCode: page.fbaBoxCode,
+        weightKg,
+        hsCode: product.hsCode,
+        productNameCn: product.productName,
+        productNameEn: inferEnglishName(product.productName, product.sku),
+        qtyPerBox: product.boxMap[boxNo] ?? 0,
+        declarePrice: product.purchaseCost ? Number((product.purchaseCost / 8).toFixed(2)) : "",
+        image: product.image,
+      });
+    });
+
+    if (page.skuType === "Single SKU" && page.sku) {
+      const hasMatchedSku = matchedProducts.some((product) => product.sku.replace(/\s+/g, "") === page.sku.replace(/\s+/g, ""));
+      if (!hasMatchedSku) {
+        // Current version trusts A table as source of truth but keeps the page mapping by box number.
+        void pageIndex;
+      }
+    }
+  });
+
+  return lines;
+}
+
+export async function buildDWorkbooks(
+  file: File,
+  aSummary: AWorkbookSummary,
+  pdfSummaries: PdfSummary[],
+): Promise<NamedWorkbookExportResult[]> {
+  const buffer = await file.arrayBuffer();
+  const exports: NamedWorkbookExportResult[] = [];
+
+  for (const pdfSummary of pdfSummaries) {
+    const workbook = XLSX.read(buffer.slice(0), { type: "array" });
+    const sheet = workbook.Sheets["Sheet1"];
+
+    if (!sheet) {
+      throw new Error("D表缺少 Sheet1");
+    }
+
+    XLSX.utils.sheet_add_aoa(sheet, [[pdfSummary.fbaCode]], { origin: "B3" });
+    XLSX.utils.sheet_add_aoa(sheet, [[pdfSummary.warehouseCode]], { origin: "E3" });
+    XLSX.utils.sheet_add_aoa(sheet, [[pdfSummary.channelName || ""]], { origin: "B4" });
+    XLSX.utils.sheet_add_aoa(sheet, [["美国"]], { origin: "B5" });
+    XLSX.utils.sheet_add_aoa(sheet, [[pdfSummary.pages.length]], { origin: "B6" });
+    XLSX.utils.sheet_add_aoa(sheet, [["一般报关"]], { origin: "B7" });
+    XLSX.utils.sheet_add_aoa(sheet, [["是"]], { origin: "B8" });
+    XLSX.utils.sheet_add_aoa(sheet, [["否"]], { origin: "B11" });
+
+    const lines = buildDLinesForPdf(aSummary, pdfSummary);
+    const dataRows = lines.map((line) => [
+      line.boxNo,
+      line.fbaBoxCode,
+      "",
+      line.weightKg || "",
+      50,
+      40,
+      40,
+      line.hsCode,
+      line.productNameCn,
+      line.productNameEn,
+      line.qtyPerBox || "",
+      line.declarePrice,
+      "无",
+      "无",
+      "尼龙/Nylon",
+      "户外/Outdoor",
+      line.image,
+    ]);
+
+    if (dataRows.length) {
+      XLSX.utils.sheet_add_aoa(sheet, dataRows, { origin: { r: 15, c: 0 } });
+    }
+
+    const output = XLSX.write(workbook, { type: "array", bookType: "xlsx" });
+    const fileName = pdfSummary.renamedFileName.replace(/\.pdf$/i, ".xlsx");
+
+    exports.push({
+      key: pdfSummary.fileNameBase,
+      fileName,
+      blob: new Blob([output], {
+        type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      }),
+    });
+  }
+
+  return exports;
 }

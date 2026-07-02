@@ -77,6 +77,7 @@ export type PdfPageSummary = {
 
 export type PdfSummary = {
   fileNameBase: string;
+  shipmentTitle: string;
   shipmentName: string;
   warehouseCode: string;
   fbaCode: string;
@@ -89,6 +90,10 @@ export type PdfSummary = {
 export type WorkbookExportResult = {
   fileName: string;
   blob: Blob;
+};
+
+export type NamedWorkbookExportResult = WorkbookExportResult & {
+  key: string;
 };
 
 export type LogisticsWorkspaceState = {
@@ -104,6 +109,8 @@ export type LogisticsWorkspaceState = {
   pdfSummaries: PdfSummary[];
   bExport: WorkbookExportResult | null;
   cExport: WorkbookExportResult | null;
+  cError: string | null;
   summaryExport: WorkbookExportResult | null;
+  dExports: NamedWorkbookExportResult[];
   logs: LogisticsLogEntry[];
 };

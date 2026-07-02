@@ -17,7 +17,7 @@ import { AppShell } from "@/components/app-shell/app-shell";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { buildBWorkbook, buildCWorkbook, buildSummaryWorkbook, parseAWorkbook, parseBWorkbook, parseCWorkbook, parseDWorkbook } from "@/lib/logistics/excel";
+import { buildBWorkbook, buildCWorkbook, buildDWorkbooks, buildSummaryWorkbook, parseAWorkbook, parseBWorkbook, parseCWorkbook, parseDWorkbook } from "@/lib/logistics/excel";
 import { parsePdfFile } from "@/lib/logistics/pdf";
 import type { LogisticsLogEntry, LogisticsStatusTone, LogisticsWorkspaceState, UploadedFileState } from "@/lib/logistics/types";
 import { downloadBlob, formatMetricNumber, makeId } from "@/lib/logistics/utils";
@@ -35,7 +35,9 @@ const initialState: LogisticsWorkspaceState = {
   pdfSummaries: [],
   bExport: null,
   cExport: null,
+  cError: null,
   summaryExport: null,
+  dExports: [],
   logs: [],
 };
 
@@ -90,6 +92,7 @@ export function LogisticsWorkbench() {
           ...current,
           cFile: setUploadedFileState(slot, file),
           cSummary,
+          cError: null,
         }));
         pushLog({ level: "success", message: `C表已解析，识别箱数 ${cSummary.totalBoxes}` });
       }
@@ -127,7 +130,10 @@ export function LogisticsWorkbench() {
         pdfFiles: files.map((file) => setUploadedFileState("pdf", file)),
         pdfSummaries: summaries,
       }));
-      pushLog({ level: "success", message: `已识别 ${summaries.length} 个 PDF，共 ${summaries.reduce((sum, item) => sum + item.pages.length, 0)} 页` });
+      pushLog({
+        level: "success",
+        message: `已识别 ${summaries.length} 个 PDF，共 ${summaries.reduce((sum, item) => sum + item.pages.length, 0)} 页，并提取货件标题用于重命名和任务总览`,
+      });
     } catch (error) {
       const message = error instanceof Error ? error.message : "PDF 解析失败";
       pushLog({ level: "error", message });
@@ -160,13 +166,20 @@ export function LogisticsWorkbench() {
       return;
     }
 
+    if (state.cSummary && state.cSummary.totalBoxes === 0) {
+      pushLog({ level: "error", message: "当前 C 表没有识别到任何箱号列，请重新上传或检查模板结构" });
+      return;
+    }
+
     setBusy(true);
     try {
       const result = await buildCWorkbook(rawFiles.c, state.aSummary);
-      setState((current) => ({ ...current, cExport: result }));
+      setState((current) => ({ ...current, cExport: result, cError: null }));
       pushLog({ level: "success", message: `C表已生成：${result.fileName}` });
     } catch (error) {
-      pushLog({ level: "error", message: error instanceof Error ? error.message : "生成 C 表失败" });
+      const message = error instanceof Error ? error.message : "生成 C 表失败";
+      setState((current) => ({ ...current, cError: message, cExport: null }));
+      pushLog({ level: "error", message });
     } finally {
       setBusy(false);
     }
@@ -185,6 +198,24 @@ export function LogisticsWorkbench() {
       pushLog({ level: "success", message: `汇总表已生成：${result.fileName}` });
     } catch (error) {
       pushLog({ level: "error", message: error instanceof Error ? error.message : "生成汇总表失败" });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleBuildD = async () => {
+    if (!rawFiles.d || !state.aSummary || !state.pdfSummaries.length) {
+      pushLog({ level: "warning", message: "生成物流发票前请先上传 A 表、D 模板和 PDF" });
+      return;
+    }
+
+    setBusy(true);
+    try {
+      const results = await buildDWorkbooks(rawFiles.d, state.aSummary, state.pdfSummaries);
+      setState((current) => ({ ...current, dExports: results }));
+      pushLog({ level: "success", message: `已生成 ${results.length} 个物流发票文件` });
+    } catch (error) {
+      pushLog({ level: "error", message: error instanceof Error ? error.message : "生成物流发票失败" });
     } finally {
       setBusy(false);
     }
@@ -216,28 +247,25 @@ export function LogisticsWorkbench() {
   };
 
   const handleDownloadInvoiceTemplate = async (index?: number) => {
-    const dFile = rawFiles.d;
-    if (!dFile) {
-      pushLog({ level: "warning", message: "请先上传物流模板 D" });
+    if (!state.dExports.length) {
+      pushLog({ level: "warning", message: "请先生成物流发票" });
       return;
     }
 
-    const targetSummary = typeof index === "number" ? state.pdfSummaries[index] : state.pdfSummaries[0];
-    const baseName = targetSummary
-      ? `${targetSummary.shipmentName || "货件"}-${targetSummary.warehouseCode || "仓库"}-${targetSummary.fbaCode || "FBA"}-物流发票.xlsx`
-      : `物流发票模板_${Date.now()}.xlsx`;
+    const target = typeof index === "number" ? state.dExports[index] : state.dExports[0];
+    if (!target) {
+      pushLog({ level: "warning", message: "未找到对应物流发票文件" });
+      return;
+    }
 
-    const buffer = await dFile.arrayBuffer();
-    downloadBlob(
-      new Blob([buffer], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }),
-      baseName,
-    );
+    downloadBlob(target.blob, target.fileName);
   };
 
   const taskSummary = useMemo(() => {
     const primaryPdfSummary = state.pdfSummaries[0] ?? null;
 
     return {
+      shipmentTitle: primaryPdfSummary?.shipmentTitle || "--",
       shipmentName: primaryPdfSummary?.shipmentName || "--",
       warehouseCode: primaryPdfSummary?.warehouseCode || "--",
       fbaCode: primaryPdfSummary?.fbaCode || "--",
@@ -270,58 +298,70 @@ export function LogisticsWorkbench() {
   return (
     <AppShell title="亚马逊物流处理系统" subtitle="上传装箱表、发货模板、包装箱表、箱唛 PDF、物流模板，自动生成发货与物流文件">
       <div className="space-y-6">
-        <section className="grid gap-4 xl:grid-cols-5">
-          <UploadCard
-            title="装箱表 A"
-            description="读取最后一个 sheet，提取 SKU、发货总数、箱号分布"
-            file={state.aFile}
-            status={state.aSummary ? ["已识别", `${state.aSummary.latestSheetName}`] : undefined}
-            onSelect={(file) => handleFileUpload("a", file)}
-          />
-          <UploadCard
-            title="发货模板 B"
-            description="识别亚马逊官方 Create workflow 模板"
-            file={state.bFile}
-            status={state.bSummary ? ["模板", state.bSummary.templateType] : undefined}
-            actionLabel="生成 B 表"
-            actionDisabled={!state.aSummary || !rawFiles.b}
-            onAction={handleBuildB}
-            downloadLabel="下载 B 表"
-            onDownload={() => downloadExport("bExport")}
-            onSelect={(file) => handleFileUpload("b", file)}
-          />
-          <UploadCard
-            title="包装箱表 C"
-            description="按 SKU 和箱号自动回填数量、重量、尺寸"
-            file={state.cFile}
-            status={state.cExport ? ["已生成", state.cExport.fileName] : state.cSummary ? ["箱数", String(state.cSummary.totalBoxes)] : undefined}
-            actionLabel="生成 C 表"
-            actionDisabled={!state.aSummary || !rawFiles.c}
-            onAction={handleBuildC}
-            downloadLabel="下载 C 表"
-            downloadDisabled={!state.cExport}
-            onDownload={() => downloadExport("cExport")}
-            onSelect={(file) => handleFileUpload("c", file)}
-          />
-          <UploadCard
-            title="箱唛 PDF"
-            description="读取货件号、仓库、FBA 编号、箱数"
-            files={state.pdfFiles}
-            status={state.pdfSummaries.length ? ["票数", String(state.pdfSummaries.length)] : undefined}
-            downloadLabel="下载箱唛"
-            onDownload={() => handleDownloadRenamedPdf()}
-            onSelectMany={(files) => handlePdfUploads(files)}
-            multiple
-          />
-          <UploadCard
-            title="物流模板 D"
-            description="识别物流发票模板与 FBA 仓库地址表"
-            file={state.dFile}
-            status={state.dSummary ? ["主模板", state.dSummary.templateSheetName || "未知"] : undefined}
-            downloadLabel="下载发票"
-            onDownload={() => handleDownloadInvoiceTemplate()}
-            onSelect={(file) => handleFileUpload("d", file)}
-          />
+        <section className="grid gap-4 md:grid-cols-2 xl:grid-cols-5">
+            <UploadCard
+              title="装箱表 A"
+              description="读取最后一个 sheet，提取 SKU、发货总数、箱号分布"
+              file={state.aFile}
+              status={state.aSummary ? ["已识别", `${state.aSummary.latestSheetName}`] : undefined}
+              onSelect={(file) => handleFileUpload("a", file)}
+            />
+            <UploadCard
+              title="发货模板 B"
+              description="识别亚马逊官方 Create workflow 模板"
+              file={state.bFile}
+              status={state.bSummary ? ["模板", state.bSummary.templateType] : undefined}
+              actionLabel="生成 B 表"
+              actionDisabled={!state.aSummary || !rawFiles.b}
+              onAction={handleBuildB}
+              downloadLabel="下载 B 表"
+              onDownload={() => downloadExport("bExport")}
+              onSelect={(file) => handleFileUpload("b", file)}
+            />
+            <UploadCard
+              title="包装箱表 C"
+              description="按 SKU 和箱号自动回填数量、重量、尺寸"
+              file={state.cFile}
+              status={
+                state.cExport
+                  ? ["已生成", state.cExport.fileName]
+                  : state.cError
+                    ? ["生成失败", state.cError]
+                  : state.cSummary
+                    ? [state.cSummary.totalBoxes === 0 ? "识别失败" : "箱数", String(state.cSummary.totalBoxes)]
+                    : undefined
+              }
+              actionLabel="生成 C 表"
+              actionDisabled={!state.aSummary || !rawFiles.c}
+              onAction={handleBuildC}
+              downloadLabel="下载 C 表"
+              downloadDisabled={!state.cExport}
+              onDownload={() => downloadExport("cExport")}
+              onSelect={(file) => handleFileUpload("c", file)}
+            />
+            <UploadCard
+              title="箱唛 PDF"
+              description="读取 PDF 页面中的货件号、仓库、FBA 编号，箱数按页数计算"
+              files={state.pdfFiles}
+              status={state.pdfSummaries.length ? ["票数", String(state.pdfSummaries.length)] : undefined}
+              downloadLabel="下载箱唛"
+              onDownload={() => handleDownloadRenamedPdf()}
+              onSelectMany={(files) => handlePdfUploads(files)}
+              multiple
+            />
+            <UploadCard
+              title="物流模板 D"
+              description="识别物流发票模板与 FBA 仓库地址表"
+              file={state.dFile}
+              status={state.dExports.length ? ["已生成", `${state.dExports.length} 个物流表`] : state.dSummary ? ["主模板", state.dSummary.templateSheetName || "未知"] : undefined}
+              actionLabel="生成发票"
+              actionDisabled={!state.aSummary || !rawFiles.d || !state.pdfSummaries.length}
+              onAction={handleBuildD}
+              downloadLabel="下载发票"
+              downloadDisabled={!state.dExports.length}
+              onDownload={() => handleDownloadInvoiceTemplate()}
+              onSelect={(file) => handleFileUpload("d", file)}
+            />
         </section>
 
         <section className="grid gap-4 xl:grid-cols-[1.1fr_0.9fr]">
@@ -329,7 +369,7 @@ export function LogisticsWorkbench() {
             <CardHeader className="flex flex-row items-center justify-between">
               <div>
                 <CardTitle>任务总览</CardTitle>
-                <p className="mt-1 text-sm text-muted">根据当前上传文件汇总核心指标和缺失情况</p>
+                <p className="mt-1 text-sm text-muted">根据 PDF 页面解析结果展示货件信息，不再依赖文件名</p>
               </div>
               <div className="flex items-center gap-2">
                 <Button variant="secondary" onClick={handleBuildSummary} disabled={!state.aSummary || busy}>
@@ -347,6 +387,7 @@ export function LogisticsWorkbench() {
                 <table className="min-w-full text-left text-sm">
                   <thead>
                     <tr className="border-b border-border text-muted">
+                      <th className="px-3 py-2">货件标题</th>
                       <th className="px-3 py-2">货件号</th>
                       <th className="px-3 py-2">仓库</th>
                       <th className="px-3 py-2">FBA编号</th>
@@ -359,6 +400,7 @@ export function LogisticsWorkbench() {
                   <tbody>
                     {state.pdfSummaries.map((item, index) => (
                       <tr key={`${item.fileNameBase}-${index}`} className="border-b border-border/70">
+                        <td className="px-3 py-3 font-semibold">{item.shipmentTitle || "--"}</td>
                         <td className="px-3 py-3 font-semibold">{item.shipmentName || "--"}</td>
                         <td className="px-3 py-3">{item.warehouseCode || "--"}</td>
                         <td className="px-3 py-3">{item.fbaCode || "--"}</td>
@@ -371,7 +413,7 @@ export function LogisticsWorkbench() {
                               <FileArchive className="h-4 w-4" />
                               下载箱唛
                             </Button>
-                            <Button size="sm" onClick={() => handleDownloadInvoiceTemplate(index)}>
+                            <Button size="sm" onClick={() => handleDownloadInvoiceTemplate(index)} disabled={!state.dExports[index]}>
                               <Download className="h-4 w-4" />
                               下载发票
                             </Button>
@@ -381,7 +423,7 @@ export function LogisticsWorkbench() {
                     ))}
                     {!state.pdfSummaries.length && (
                       <tr>
-                        <td colSpan={7} className="px-3 py-8 text-center text-muted">
+                        <td colSpan={8} className="px-3 py-8 text-center text-muted">
                           上传 PDF 后，这里会按每个货件逐条展示
                         </td>
                       </tr>
@@ -389,12 +431,14 @@ export function LogisticsWorkbench() {
                   </tbody>
                 </table>
               </div>
-              <div className="grid gap-4 md:grid-cols-3 xl:grid-cols-5">
-                <MetricCard label="默认货件号" value={taskSummary.shipmentName} />
-                <MetricCard label="SKU数" value={formatMetricNumber(taskSummary.skuCount)} />
-                <MetricCard label="发货总数" value={formatMetricNumber(taskSummary.totalShipment)} />
-                <MetricCard label="PDF票数" value={formatMetricNumber(taskSummary.pdfCount)} />
-                <MetricCard label="PDF页数" value={formatMetricNumber(taskSummary.pdfPageCount)} />
+              <div className="overflow-x-auto pb-2">
+                <div className="flex min-w-max gap-4">
+                  <MetricCard label="默认货件标题" value={taskSummary.shipmentTitle} />
+                  <MetricCard label="SKU数" value={formatMetricNumber(taskSummary.skuCount)} />
+                  <MetricCard label="发货总数" value={formatMetricNumber(taskSummary.totalShipment)} />
+                  <MetricCard label="PDF票数" value={formatMetricNumber(taskSummary.pdfCount)} />
+                  <MetricCard label="PDF页数" value={formatMetricNumber(taskSummary.pdfPageCount)} />
+                </div>
               </div>
             </CardContent>
           </Card>
@@ -412,6 +456,9 @@ export function LogisticsWorkbench() {
               </Button>
               <Button variant="secondary" disabled={busy} onClick={handleBuildSummary}>
                 生成汇总表
+              </Button>
+              <Button variant="secondary" disabled={busy} onClick={handleBuildD}>
+                生成物流发票
               </Button>
               <Button variant="ghost" disabled={busy} onClick={() => setState(initialState)}>
                 <RefreshCw className="h-4 w-4" />
@@ -475,6 +522,7 @@ export function LogisticsWorkbench() {
                   <div className="flex items-center justify-between gap-3">
                     <div>
                       <p className="text-sm font-bold text-foreground">{pdf.renamedFileName}</p>
+                      <p className="mt-1 text-xs text-muted">{pdf.shipmentTitle || "--"}</p>
                       <p className="mt-1 text-xs text-muted">
                         {pdf.shipmentName || "--"} / {pdf.warehouseCode || "--"} / {pdf.fbaCode || "--"}
                       </p>
@@ -516,9 +564,15 @@ export function LogisticsWorkbench() {
               <ExportRow label="B 发货表" ready={Boolean(state.bExport)} onDownload={() => downloadExport("bExport")} />
               <ExportRow label="C 包装箱表" ready={Boolean(state.cExport)} onDownload={() => downloadExport("cExport")} />
               <ExportRow label="装箱汇总表" ready={Boolean(state.summaryExport)} onDownload={() => downloadExport("summaryExport")} />
+              <ExportRow
+                label="物流发票"
+                ready={Boolean(state.dExports.length)}
+                description={state.dExports.length ? `已生成 ${state.dExports.length} 个与 PDF 同名的物流表` : "尚未生成"}
+                onDownload={() => handleDownloadInvoiceTemplate()}
+              />
               <div className="rounded-lg border border-dashed border-border p-3 text-xs leading-6 text-muted">
-                当前版本已完成 A/B/C/汇总表主流程，以及多 PDF 基于文件名的元信息识别。
-                D 模板逐箱写入和 PDF 页内精确文本提取已预留结构，建议作为下一阶段继续补强。
+                当前版本会为每个 PDF 生成一个同名物流表，例如 `货件3-LGB8-FBA19H4WYDTY-7箱.xlsx`。
+                英文名目前优先使用系统内置映射，后续可补手动维护和缓存机制。
               </div>
             </CardContent>
           </Card>
@@ -591,16 +645,16 @@ function UploadCard({
   const uploadLabel = multiple ? (files?.length ? "重新上传多个文件" : "点击上传多个文件") : (file ? "重新上传文件" : "点击上传文件");
 
   return (
-    <Card className="h-full">
+    <Card className="h-full min-w-0">
       <CardHeader>
         <CardTitle>{title}</CardTitle>
       </CardHeader>
-      <CardContent className="flex h-[260px] flex-col">
-        <p className="text-sm leading-6 text-muted">{description}</p>
-        <label className="mt-4 flex flex-1 cursor-pointer flex-col items-center justify-center rounded-lg border border-dashed border-border bg-surface-muted px-4 text-center transition-colors hover:border-brand hover:bg-white">
-          <UploadCloud className="h-8 w-8 text-brand" />
-          <span className="mt-3 text-sm font-semibold text-foreground">{uploadLabel}</span>
-          <span className="mt-1 line-clamp-2 max-w-full overflow-hidden text-ellipsis break-all text-xs text-muted">{currentFileLabel}</span>
+      <CardContent className="flex h-[248px] flex-col">
+        <p className="text-sm leading-6 text-muted line-clamp-2">{description}</p>
+        <label className="mt-3 flex flex-1 cursor-pointer flex-col items-center justify-center rounded-lg border border-dashed border-border bg-surface-muted px-3 text-center transition-colors hover:border-brand hover:bg-white">
+          <UploadCloud className="h-7 w-7 text-brand" />
+          <span className="mt-2 text-sm font-semibold text-foreground">{uploadLabel}</span>
+          <span className="mt-1 line-clamp-2 max-w-full overflow-hidden text-ellipsis break-all text-xs leading-5 text-muted">{currentFileLabel}</span>
           <input
             type="file"
             className="hidden"
@@ -620,24 +674,24 @@ function UploadCard({
             }}
           />
         </label>
-        <div className="mt-4 flex min-h-[52px] items-center justify-between gap-2">
+        <div className="mt-3 flex min-h-[52px] items-start justify-between gap-2">
           {status ? (
-            <div className="space-y-1">
+            <div className="min-w-0 space-y-1">
               <Badge tone="green">{status[0]}</Badge>
-              <p className="text-xs text-muted">{status[1]}</p>
+              <p className="line-clamp-2 break-all text-xs text-muted">{status[1]}</p>
             </div>
           ) : (
             <Badge>待上传</Badge>
           )}
-          <div className="flex gap-2">
+          <div className="flex w-[124px] shrink-0 flex-col gap-2">
             {onAction && actionLabel ? (
-              <Button size="sm" variant="secondary" onClick={onAction} disabled={actionDisabled}>
+              <Button size="sm" variant="secondary" className="w-full justify-center" onClick={onAction} disabled={actionDisabled}>
                 <Package className="h-4 w-4" />
                 {actionLabel}
               </Button>
             ) : null}
             {onDownload && downloadLabel ? (
-              <Button size="sm" onClick={onDownload} disabled={downloadDisabled}>
+              <Button size="sm" className="w-full justify-center" onClick={onDownload} disabled={downloadDisabled}>
                 <Download className="h-4 w-4" />
                 {downloadLabel}
               </Button>
@@ -651,21 +705,31 @@ function UploadCard({
 
 function MetricCard({ label, value }: { label: string; value: string }) {
   return (
-    <div className="rounded-lg border border-border bg-surface-muted p-4">
+    <div className="w-[160px] min-w-[160px] rounded-lg border border-border bg-surface-muted p-4">
       <p className="text-xs font-semibold tracking-wide text-muted">{label}</p>
       <p className="mt-3 text-2xl font-black text-foreground metric-tabular">{value}</p>
     </div>
   );
 }
 
-function ExportRow({ label, ready, onDownload }: { label: string; ready: boolean; onDownload: () => void }) {
+function ExportRow({
+  label,
+  ready,
+  onDownload,
+  description,
+}: {
+  label: string;
+  ready: boolean;
+  onDownload: () => void;
+  description?: string;
+}) {
   return (
     <div className="flex items-center justify-between rounded-lg border border-border bg-surface-muted px-4 py-3">
       <div className="flex items-center gap-3">
         <FileText className="h-4 w-4 text-brand" />
         <div>
           <p className="text-sm font-semibold text-foreground">{label}</p>
-          <p className="text-xs text-muted">{ready ? "文件已生成，可直接下载" : "尚未生成"}</p>
+          <p className="text-xs text-muted">{description ?? (ready ? "文件已生成，可直接下载" : "尚未生成")}</p>
         </div>
       </div>
       <Button size="sm" onClick={onDownload} disabled={!ready}>
