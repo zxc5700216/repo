@@ -1,7 +1,7 @@
 ﻿"use client";
 
-import { ArrowUpRight, RotateCcw, Search, SlidersHorizontal, UploadCloud } from "lucide-react";
-import { useDeferredValue, useEffect, useMemo, useState } from "react";
+import { ArrowUpRight, Download, RotateCcw, Search, SlidersHorizontal, UploadCloud } from "lucide-react";
+import { useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { useBulkUpload } from "@/lib/hooks/use-bulk-upload";
@@ -42,6 +42,23 @@ function buildPageItems(currentPage: number, totalPages: number) {
   return [1, "...", currentPage - 1, currentPage, currentPage + 1, "...", totalPages];
 }
 
+function escapeCsvCell(value: string | number | undefined) {
+  const text = value === undefined ? "" : String(value);
+  return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+}
+
+function downloadCsv(fileName: string, rows: Array<Array<string | number | undefined>>) {
+  const csv = rows.map((row) => row.map(escapeCsvCell).join(",")).join("\r\n");
+  const blob = new Blob([`\uFEFF${csv}`], { type: "text/csv;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+
+  link.href = url;
+  link.download = fileName;
+  link.click();
+  URL.revokeObjectURL(url);
+}
+
 export function CampaignGridHome() {
   const [query, setQuery] = useState("");
   const [page, setPage] = useState(1);
@@ -51,6 +68,7 @@ export function CampaignGridHome() {
   const [detailPage, setDetailPage] = useState(1);
   const [detailSortKey, setDetailSortKey] = useState<DetailSortKey>("keyword");
   const [detailSortDirection, setDetailSortDirection] = useState<"asc" | "desc">("asc");
+  const groupingInputRef = useRef<HTMLInputElement>(null);
   const { fileInputRef, handleFileSelected } = useBulkUpload();
   const {
     campaignGroups,
@@ -62,6 +80,7 @@ export function CampaignGridHome() {
     mergeCampaignGroupsIntoWorkspaceUnit,
     removeCampaignGroupFromWorkspaceUnit,
     setActiveWorkspaceUnit,
+    importGroupingStatusCsv,
   } = useWorkspaceStore();
 
   const groupedCampaignIds = useMemo(
@@ -206,6 +225,43 @@ export function CampaignGridHome() {
     );
   }
 
+  function handleDownloadGroupingStatus() {
+    const workspaceUnitByCampaignGroupId = new Map<string, string>();
+
+    workspaceUnits.forEach((unit) => {
+      unit.campaignGroupIds.forEach((campaignGroupId) => {
+        workspaceUnitByCampaignGroupId.set(campaignGroupId, unit.name);
+      });
+    });
+
+    downloadCsv("campaign-grouping-status.csv", [
+      ["campaignGroupId", "sheetName", "campaignName", "adGroupName", "lifecycleGroup", "workspaceUnit"],
+      ...campaignGroups.map((group) => [
+        group.id,
+        group.sheetName ?? "",
+        group.campaignName,
+        group.adGroupName,
+        group.lifecycleGroupId ?? "",
+        workspaceUnitByCampaignGroupId.get(group.id) ?? "",
+      ]),
+    ]);
+  }
+
+  async function handleGroupingStatusSelected(file: File | undefined) {
+    if (!file) {
+      return;
+    }
+
+    const text = await file.text();
+    const result = importGroupingStatusCsv(file.name, text);
+
+    window.alert(`已导入 ${result.importedRows} 个广告组，生成 ${result.workspaceUnitCount} 个工作区分组。`);
+
+    if (groupingInputRef.current) {
+      groupingInputRef.current.value = "";
+    }
+  }
+
   function renderMetricCell(value: string | number, align: "left" | "right" = "left") {
     return <td className={`px-3 py-2 ${align === "right" ? "text-right" : "text-left"}`}>{value}</td>;
   }
@@ -240,9 +296,25 @@ export function CampaignGridHome() {
           aria-hidden
           onChange={(event) => void handleFileSelected(event.target.files?.[0])}
         />
+        <input
+          ref={groupingInputRef}
+          type="file"
+          accept=".csv,text/csv"
+          className="hidden"
+          aria-hidden
+          onChange={(event) => void handleGroupingStatusSelected(event.target.files?.[0])}
+        />
         <Button onClick={() => fileInputRef.current?.click()}>
           <UploadCloud className="h-4 w-4" />
           Upload Bulk
+        </Button>
+        <Button variant="secondary" onClick={() => groupingInputRef.current?.click()}>
+          <UploadCloud className="h-4 w-4" />
+          上传分组
+        </Button>
+        <Button variant="secondary" onClick={handleDownloadGroupingStatus}>
+          <Download className="h-4 w-4" />
+          下载分组状态
         </Button>
         <div className="flex h-10 min-w-[240px] flex-1 items-center gap-2 rounded-lg border border-border px-3">
           <Search className="h-4 w-4 text-muted" />

@@ -74,6 +74,7 @@ interface WorkspaceState {
   setActiveWorkspaceUnit: (workspaceUnitId: string) => void;
   setActiveLifecycleGroup: (lifecycleGroupId?: LifecycleGroupId) => void;
   assignLifecycleGroup: (campaignGroupId: string, lifecycleGroupId: LifecycleGroupId) => void;
+  importGroupingStatusCsv: (fileName: string, text: string) => { importedRows: number; workspaceUnitCount: number };
   runRulesForActiveGroup: () => void;
   runRulesForActiveLifecycleGroup: () => void;
   runRulesForActiveWorkspaceUnit: () => void;
@@ -304,6 +305,22 @@ function parseCsv(text: string): SheetRow[] {
   });
 }
 
+function readLooseColumn(row: SheetRow, candidates: string[]) {
+  const entries = Object.entries(row).filter(([key]) => !key.startsWith("__"));
+  const normalizedEntries = entries.map(([key, value]) => [normalizeHeader(key), value] as const);
+
+  for (const candidate of candidates.map(normalizeHeader)) {
+    const entry = normalizedEntries.find(([key]) => key === candidate);
+
+    if (entry) {
+      const value = entry[1];
+      return value === null || value === undefined ? "" : String(value).trim();
+    }
+  }
+
+  return "";
+}
+
 function normalizeMatchValue(value: string | undefined) {
   return (value ?? "")
     .trim()
@@ -494,6 +511,86 @@ function rebuildWorkspaceUnits(workspaceUnits: WorkspaceUnit[], campaignGroups: 
       };
     })
     .filter((unit) => unit.campaignGroupIds.length > 1);
+}
+
+function isLifecycleGroupId(value: string): value is LifecycleGroupId {
+  return ["launch", "mature", "decline", "clearance"].includes(value);
+}
+
+function buildCampaignGroupLookup(groups: CampaignGroup[]) {
+  return groups.reduce<Map<string, string>>((lookup, group) => {
+    [
+      group.id,
+      group.adGroupName,
+      `${group.sheetName ?? ""}::${group.adGroupName}`,
+      `${group.campaignName}::${group.adGroupName}`,
+    ].forEach((value) => {
+      const normalized = normalizeMatchValue(value);
+
+      if (normalized) {
+        lookup.set(normalized, group.id);
+      }
+    });
+
+    return lookup;
+  }, new Map());
+}
+
+function buildWorkspaceUnitsFromGroupingRows(rows: SheetRow[], groups: CampaignGroup[]) {
+  const groupLookup = buildCampaignGroupLookup(groups);
+  const unitRows = new Map<string, string[]>();
+  const lifecycleByCampaignGroupId = new Map<string, LifecycleGroupId | undefined>();
+  let importedRows = 0;
+
+  rows.forEach((row) => {
+    const campaignGroupKey =
+      readLooseColumn(row, ["campaignGroupId", "campaign_group_id", "id"]) ||
+      readLooseColumn(row, ["adGroupName", "ad_group_name", "Ad Group Name"]) ||
+      readLooseColumn(row, ["campaignName", "campaign_name", "Campaign Name"]);
+    const campaignGroupId = groupLookup.get(normalizeMatchValue(campaignGroupKey));
+
+    if (!campaignGroupId) {
+      return;
+    }
+
+    importedRows += 1;
+
+    const rawLifecycle = readLooseColumn(row, ["lifecycleGroup", "lifecycleGroupId", "lifecycle", "生命周期分组"]).toLowerCase();
+    lifecycleByCampaignGroupId.set(campaignGroupId, isLifecycleGroupId(rawLifecycle) ? rawLifecycle : undefined);
+
+    const workspaceUnitName = readLooseColumn(row, ["workspaceUnit", "workspaceUnitId", "workspace", "分组"]);
+
+    if (!workspaceUnitName) {
+      return;
+    }
+
+    const workspaceUnitKey = normalizeMatchValue(workspaceUnitName);
+    const currentIds = unitRows.get(workspaceUnitKey) ?? [];
+    unitRows.set(workspaceUnitKey, Array.from(new Set([...currentIds, campaignGroupId])));
+  });
+
+  const now = new Date().toISOString();
+  const workspaceUnits = Array.from(unitRows.entries()).flatMap(([key, campaignGroupIds], index): WorkspaceUnit[] => {
+    const validIds = campaignGroupIds.filter((id) => groups.some((group) => group.id === id));
+
+    if (validIds.length < 2) {
+      return [];
+    }
+
+    const unitGroups = groups.filter((group) => validIds.includes(group.id));
+
+    return [
+      {
+        id: `imported-workspace-unit-${index + 1}-${key.replace(/[^a-z0-9\u4e00-\u9fff]+/g, "-").slice(0, 32)}`,
+        name: buildWorkspaceUnitName(unitGroups),
+        campaignGroupIds: validIds,
+        createdAt: now,
+        updatedAt: now,
+      },
+    ];
+  });
+
+  return { importedRows, lifecycleByCampaignGroupId, workspaceUnits };
 }
 
 function findWorkspaceUnitByCampaignGroupId(workspaceUnits: WorkspaceUnit[], campaignGroupId: string) {
@@ -871,6 +968,34 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
         activeCampaignGroupId: campaignGroupId,
       };
     }),
+  importGroupingStatusCsv: (_fileName, text) => {
+    const rows = parseCsv(text);
+    const result = buildWorkspaceUnitsFromGroupingRows(rows, get().campaignGroups);
+
+    set((state) => {
+      const campaignGroups = state.campaignGroups.map((group) =>
+        result.lifecycleByCampaignGroupId.has(group.id)
+          ? { ...group, lifecycleGroupId: result.lifecycleByCampaignGroupId.get(group.id) }
+          : group,
+      );
+      const activeWorkspaceUnit = result.workspaceUnits.find((unit) => unit.campaignGroupIds.includes(state.activeCampaignGroupId));
+
+      return {
+        campaignGroups,
+        campaignSheetGroups: buildSheetGroups(campaignGroups),
+        workspaceUnits: result.workspaceUnits,
+        activeWorkspaceUnitId: activeWorkspaceUnit?.id,
+        workspaceMode: activeWorkspaceUnit ? "workspace-unit" : "campaign",
+        adjustmentDrafts: [],
+        selectedDraftIds: [],
+      };
+    });
+
+    return {
+      importedRows: result.importedRows,
+      workspaceUnitCount: result.workspaceUnits.length,
+    };
+  },
   runRulesForActiveGroup: () => {
     const state = get();
     const campaignGroup = state.campaignGroups.find((group) => group.id === state.activeCampaignGroupId);
@@ -1230,6 +1355,7 @@ if (typeof window !== "undefined") {
     const shouldSave =
       state.campaignGroups !== previousState.campaignGroups ||
       state.rules !== previousState.rules ||
+      state.workspaceUnits !== previousState.workspaceUnits ||
       state.performanceRows !== previousState.performanceRows ||
       state.activeCampaignGroupId !== previousState.activeCampaignGroupId ||
       state.activeLifecycleGroupId !== previousState.activeLifecycleGroupId ||

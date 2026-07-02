@@ -3,8 +3,8 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "NEXT_DIST_DIR=.next-dev next dev --turbopack",
-    "build": "NEXT_DIST_DIR=.next-build next build",
+    "dev": "node scripts/next-run.mjs .next-dev dev --turbopack",
+    "build": "node scripts/next-run.mjs .next-build build",
     "start": "next start",
     "lint": "eslint"
   },
