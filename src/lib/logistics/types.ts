@@ -73,6 +73,12 @@ export type DWorkbookSummary = {
   warehouseSheetName: string | null;
 };
 
+export type LogisticsTemplateOption = {
+  id: string;
+  label: string;
+  enabled: boolean;
+};
+
 export type PdfPageSummary = {
   pageNumber: number;
   shipmentName: string;
@@ -127,5 +133,6 @@ export type LogisticsWorkspaceState = {
   summaryExport: WorkbookExportResult | null;
   compareExport: WorkbookExportResult | null;
   dExports: NamedWorkbookExportResult[];
+  selectedLogisticsTemplate: string;
   logs: LogisticsLogEntry[];
 };

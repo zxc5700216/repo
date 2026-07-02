@@ -146,6 +146,32 @@ const templateRowHeights = {
   21: 28,
 };
 
+function normalizeSharedFormulas(worksheet: ExcelJS.Worksheet) {
+  worksheet.eachRow((row) => {
+    row.eachCell({ includeEmpty: false }, (cell) => {
+      const currentValue = cell.value;
+      if (!currentValue || typeof currentValue !== "object") {
+        return;
+      }
+
+      if ("formula" in currentValue && currentValue.formula) {
+        cell.value = {
+          formula: currentValue.formula,
+          result: "result" in currentValue ? currentValue.result : undefined,
+        };
+        return;
+      }
+
+      if ("sharedFormula" in currentValue && currentValue.sharedFormula) {
+        cell.value = {
+          formula: cell.formula,
+          result: "result" in currentValue ? currentValue.result : undefined,
+        };
+      }
+    });
+  });
+}
+
 function upsertNumericCell(sheetXml: string, cellRef: string, value: number) {
   const rowNumber = Number(cellRef.replace(/^[A-Z]+/u, ""));
   const cellRegex = new RegExp(`(<c[^>]*r="${cellRef}"[^>]*>)([\\s\\S]*?)(</c>)`, "u");
@@ -634,6 +660,8 @@ export async function buildComparisonWorkbook(aSummary: AWorkbookSummary, pdfSum
     throw new Error("创货件对比表模板缺少可用工作表");
   }
 
+  normalizeSharedFormulas(worksheet);
+
   const shippedRows = aSummary.rows.filter((row) => row.totalShipment > 0);
   const pages = pdfSummaries.flatMap((pdf) =>
     pdf.pages.map((page) => {
@@ -954,56 +982,99 @@ function buildDLinesForPdf(aSummary: AWorkbookSummary, pdfSummary: PdfSummary) {
 }
 
 export async function buildDWorkbooks(
-  file: File,
   aSummary: AWorkbookSummary,
   pdfSummaries: PdfSummary[],
+  templateId = "kaiqi",
 ): Promise<NamedWorkbookExportResult[]> {
-  const buffer = await file.arrayBuffer();
+  if (templateId !== "kaiqi") {
+    throw new Error("当前只支持凯奇物流模板");
+  }
+
+  const response = await fetch("/logistics-templates/kaiqi-logistics-template.xlsx");
+  if (!response.ok) {
+    throw new Error("未找到内置的凯奇物流模板");
+  }
+
+  const buffer = await response.arrayBuffer();
   const exports: NamedWorkbookExportResult[] = [];
 
   for (const pdfSummary of pdfSummaries) {
-    const workbook = XLSX.read(buffer.slice(0), { type: "array" });
-    const sheet = workbook.Sheets["Sheet1"];
+    const workbook = new ExcelJS.Workbook();
+    await workbook.xlsx.load(buffer.slice(0));
+    const sheet = workbook.getWorksheet("Sheet1");
 
     if (!sheet) {
       throw new Error("D表缺少 Sheet1");
     }
 
-    XLSX.utils.sheet_add_aoa(sheet, [[pdfSummary.fbaCode]], { origin: "B3" });
-    XLSX.utils.sheet_add_aoa(sheet, [[pdfSummary.warehouseCode]], { origin: "E3" });
-    XLSX.utils.sheet_add_aoa(sheet, [[pdfSummary.channelName || ""]], { origin: "B4" });
-    XLSX.utils.sheet_add_aoa(sheet, [["美国"]], { origin: "B5" });
-    XLSX.utils.sheet_add_aoa(sheet, [[pdfSummary.pages.length]], { origin: "B6" });
-    XLSX.utils.sheet_add_aoa(sheet, [["一般报关"]], { origin: "B7" });
-    XLSX.utils.sheet_add_aoa(sheet, [["是"]], { origin: "B8" });
-    XLSX.utils.sheet_add_aoa(sheet, [["否"]], { origin: "B11" });
+    normalizeSharedFormulas(sheet);
+
+    sheet.getCell("B3").value = pdfSummary.fbaCode;
+    sheet.getCell("E3").value = pdfSummary.warehouseCode;
+    sheet.getCell("B4").value = pdfSummary.channelName || "";
+    sheet.getCell("B5").value = "美国";
+    sheet.getCell("B6").value = pdfSummary.pages.length;
+    sheet.getCell("B7").value = "一般报关";
+    sheet.getCell("B8").value = "是";
+    sheet.getCell("B11").value = "否";
 
     const lines = buildDLinesForPdf(aSummary, pdfSummary);
-    const dataRows = lines.map((line) => [
-      line.boxNo,
-      line.fbaBoxCode,
-      "",
-      line.weightKg || "",
-      50,
-      40,
-      40,
-      line.hsCode,
-      line.productNameCn,
-      line.productNameEn,
-      line.qtyPerBox || "",
-      line.declarePrice,
-      "无",
-      "无",
-      "尼龙/Nylon",
-      "户外/Outdoor",
-      line.image,
-    ]);
+    const dataStartRow = 16;
+    const templateLastRow = 22;
+    const templateCapacity = templateLastRow - dataStartRow + 1;
+    const extraRows = Math.max(lines.length - templateCapacity, 0);
+    const maxColumns = Math.max(sheet.columnCount, 21);
+    const templateSourceRow = sheet.getRow(dataStartRow);
 
-    if (dataRows.length) {
-      XLSX.utils.sheet_add_aoa(sheet, dataRows, { origin: { r: 15, c: 0 } });
+    if (extraRows > 0) {
+      sheet.spliceRows(templateLastRow + 1, 0, ...Array.from({ length: extraRows }, () => []));
     }
 
-    const output = XLSX.write(workbook, { type: "array", bookType: "xlsx" });
+    for (let index = 0; index < lines.length; index += 1) {
+      const rowNumber = dataStartRow + index;
+      if (rowNumber <= templateLastRow) {
+        continue;
+      }
+
+      const targetRow = sheet.getRow(rowNumber);
+      targetRow.height = templateSourceRow.height;
+
+      for (let columnNumber = 1; columnNumber <= maxColumns; columnNumber += 1) {
+        const sourceCell = templateSourceRow.getCell(columnNumber);
+        const targetCell = targetRow.getCell(columnNumber);
+        targetCell.style = JSON.parse(JSON.stringify(sourceCell.style ?? {}));
+        if (sourceCell.numFmt) {
+          targetCell.numFmt = sourceCell.numFmt;
+        }
+      }
+    }
+
+    lines.forEach((line, index) => {
+      const rowNumber = dataStartRow + index;
+      sheet.getCell(`A${rowNumber}`).value = line.boxNo;
+      sheet.getCell(`B${rowNumber}`).value = line.fbaBoxCode;
+      sheet.getCell(`C${rowNumber}`).value = "";
+      sheet.getCell(`D${rowNumber}`).value = line.weightKg || "";
+      sheet.getCell(`E${rowNumber}`).value = 50;
+      sheet.getCell(`F${rowNumber}`).value = 40;
+      sheet.getCell(`G${rowNumber}`).value = 40;
+      sheet.getCell(`H${rowNumber}`).value = line.hsCode;
+      sheet.getCell(`I${rowNumber}`).value = line.productNameCn;
+      sheet.getCell(`J${rowNumber}`).value = line.productNameEn;
+      sheet.getCell(`K${rowNumber}`).value = line.qtyPerBox || "";
+      sheet.getCell(`L${rowNumber}`).value = line.declarePrice;
+      sheet.getCell(`M${rowNumber}`).value = "无";
+      sheet.getCell(`N${rowNumber}`).value = "无";
+      sheet.getCell(`O${rowNumber}`).value = "尼龙/Nylon";
+      sheet.getCell(`P${rowNumber}`).value = "户外/Outdoor";
+      sheet.getCell(`Q${rowNumber}`).value = line.image;
+      sheet.getCell(`R${rowNumber}`).value = "";
+      sheet.getCell(`S${rowNumber}`).value = "";
+      sheet.getCell(`T${rowNumber}`).value = "";
+      sheet.getCell(`U${rowNumber}`).value = "";
+    });
+
+    const output = await workbook.xlsx.writeBuffer();
     const fileName = pdfSummary.renamedFileName.replace(/\.pdf$/i, ".xlsx");
 
     exports.push({

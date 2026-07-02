@@ -1,5 +1,6 @@
 "use client";
 
+import Image from "next/image";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { BarChart3, Bot, Gauge, Home, PackageSearch, Settings, SlidersHorizontal, UploadCloud } from "lucide-react";
@@ -21,7 +22,9 @@ export function AppShell({ children, title, subtitle }: { children: React.ReactN
     <div className="min-h-screen bg-background">
       <aside className="fixed inset-y-0 left-0 z-20 flex w-[76px] flex-col items-center border-r border-border bg-white">
         <div className="flex h-16 w-full items-center justify-center border-b border-border">
-          <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-brand text-sm font-black text-white">P</div>
+          <div className="overflow-hidden rounded-lg">
+            <Image src="/brand-logo.png" alt="品牌图标" width={40} height={40} className="h-10 w-10 object-cover" />
+          </div>
         </div>
         <nav className="flex flex-1 flex-col items-center gap-2 py-4">
           {navItems.map((item) => {

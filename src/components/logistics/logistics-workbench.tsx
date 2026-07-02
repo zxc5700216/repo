@@ -16,9 +16,9 @@ import { AppShell } from "@/components/app-shell/app-shell";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { buildBWorkbook, buildCWorkbook, buildComparisonWorkbook, buildDWorkbooks, buildSaihuWorkbook, parseAWorkbook, parseBWorkbook, parseCWorkbook, parseDWorkbook, parseSaihuWorkbook } from "@/lib/logistics/excel";
+import { buildBWorkbook, buildCWorkbook, buildComparisonWorkbook, buildDWorkbooks, buildSaihuWorkbook, parseAWorkbook, parseBWorkbook, parseCWorkbook, parseSaihuWorkbook } from "@/lib/logistics/excel";
 import { parsePdfFile } from "@/lib/logistics/pdf";
-import type { LogisticsLogEntry, LogisticsStatusTone, LogisticsWorkspaceState, UploadedFileState } from "@/lib/logistics/types";
+import type { LogisticsLogEntry, LogisticsStatusTone, LogisticsTemplateOption, LogisticsWorkspaceState, UploadedFileState } from "@/lib/logistics/types";
 import { downloadBlob, downloadFilesAsZip, formatMetricNumber, makeId } from "@/lib/logistics/utils";
 
 const SLOW_PARSE_WARNING_BYTES = 30 * 1024 * 1024;
@@ -44,8 +44,18 @@ const initialState: LogisticsWorkspaceState = {
   summaryExport: null,
   compareExport: null,
   dExports: [],
+  selectedLogisticsTemplate: "kaiqi",
   logs: [],
 };
+
+const logisticsTemplateOptions: LogisticsTemplateOption[] = [
+  { id: "kaiqi", label: "凯奇", enabled: true },
+  { id: "weitu", label: "为途", enabled: false },
+  { id: "changhe", label: "长河", enabled: false },
+  { id: "pending-4", label: "4待定", enabled: false },
+  { id: "pending-5", label: "5待定", enabled: false },
+  { id: "pending-6", label: "6待定", enabled: false },
+];
 
 type FileSlot = "a" | "b" | "saihu" | "c" | "d" | "pdf";
 
@@ -136,16 +146,6 @@ export function LogisticsWorkbench() {
         pushLog({ level: "success", message: `C表已解析，识别箱数 ${cSummary.totalBoxes}` });
       }
 
-      if (slot === "d") {
-        const dSummary = await parseDWorkbook(file);
-        setState((current) => ({
-          ...current,
-          dFile: setUploadedFileState(slot, file),
-          dSummary,
-        }));
-        pushLog({ level: "success", message: `D模板已识别，主模板 sheet：${dSummary.templateSheetName ?? "未知"}` });
-      }
-
       if (slot === "saihu") {
         const saihuSummary = await parseSaihuWorkbook(file);
         setState((current) => ({
@@ -218,16 +218,22 @@ export function LogisticsWorkbench() {
   };
 
   const handleBuildD = async () => {
-    if (!rawFiles.d || !state.aSummary || !state.pdfSummaries.length) {
-      pushLog({ level: "warning", message: "生成物流发票前请先上传 A 表、D 模板和 PDF" });
+    if (!state.aSummary || !state.pdfSummaries.length) {
+      pushLog({ level: "warning", message: "生成物流发票前请先上传 A 表和 PDF" });
+      return;
+    }
+
+    if (state.selectedLogisticsTemplate !== "kaiqi") {
+      pushLog({ level: "warning", message: "当前只支持凯奇模板，其他模板待接入" });
       return;
     }
 
     setBusy(true);
     try {
-      const results = await buildDWorkbooks(rawFiles.d, state.aSummary, state.pdfSummaries);
+      const results = await buildDWorkbooks(state.aSummary, state.pdfSummaries, state.selectedLogisticsTemplate);
       setState((current) => ({ ...current, dExports: results }));
-      pushLog({ level: "success", message: `已生成 ${results.length} 个物流发票文件` });
+      pushLog({ level: "success", message: `已生成 ${results.length} 个凯奇物流发票文件` });
+      await downloadFilesAsZip(results.map((item) => ({ fileName: item.fileName, blob: item.blob })), `物流发票_${Date.now()}.zip`);
     } catch (error) {
       pushLog({ level: "error", message: error instanceof Error ? error.message : "生成物流发票失败" });
     } finally {
@@ -352,13 +358,17 @@ export function LogisticsWorkbench() {
       return;
     }
 
-    const target = typeof index === "number" ? state.dExports[index] : state.dExports[0];
-    if (!target) {
-      pushLog({ level: "warning", message: "未找到对应物流发票文件" });
+    if (typeof index === "number") {
+      const target = state.dExports[index];
+      if (!target) {
+        pushLog({ level: "warning", message: "未找到对应物流发票文件" });
+        return;
+      }
+      downloadBlob(target.blob, target.fileName);
       return;
     }
 
-    downloadBlob(target.blob, target.fileName);
+    await downloadFilesAsZip(state.dExports.map((item) => ({ fileName: item.fileName, blob: item.blob })), `物流发票_${Date.now()}.zip`);
   };
 
   const taskSummary = useMemo(() => {
@@ -402,7 +412,7 @@ export function LogisticsWorkbench() {
   };
 
   return (
-    <AppShell title="亚马逊物流处理系统" subtitle="上传装箱表、发货模板、包装箱表、箱唛 PDF、物流模板，自动生成发货与物流文件">
+    <AppShell title="亚马逊物流处理系统（美国站）" subtitle="上传装箱表、发货模板、包装箱表、箱唛 PDF、物流模板，自动生成发货与物流文件">
       <div className="space-y-6">
         <section className="grid gap-4 md:grid-cols-2 xl:grid-cols-5">
             <UploadCard
@@ -472,18 +482,19 @@ export function LogisticsWorkbench() {
               onSelectMany={(files) => handlePdfUploads(files)}
               multiple
             />
-            <UploadCard
-              title="物流模板 D"
-              description="识别物流发票模板与 FBA 仓库地址表"
-              file={state.dFile}
-              status={state.dExports.length ? ["已生成", `${state.dExports.length} 个物流表`] : state.dSummary ? ["主模板", state.dSummary.templateSheetName || "未知"] : undefined}
-              actionLabel="生成发票"
-              actionDisabled={!state.aSummary || !rawFiles.d || !state.pdfSummaries.length}
-              onAction={handleBuildD}
-              downloadLabel="下载发票"
-              downloadDisabled={!state.dExports.length}
-              onDownload={() => handleDownloadInvoiceTemplate()}
-              onSelect={(file) => handleFileUpload("d", file)}
+            <LogisticsTemplateCard
+              selectedTemplate={state.selectedLogisticsTemplate}
+              options={logisticsTemplateOptions}
+              status={state.dExports.length ? ["已生成", `${state.dExports.length} 个物流表`] : ["模板", logisticsTemplateOptions.find((item) => item.id === state.selectedLogisticsTemplate)?.label ?? "未选择"]}
+              downloadDisabled={!state.aSummary || !state.pdfSummaries.length || busy || state.selectedLogisticsTemplate !== "kaiqi"}
+              onTemplateChange={(value) => setState((current) => ({ ...current, selectedLogisticsTemplate: value, dExports: [] }))}
+              onDownload={() => {
+                if (state.dExports.length) {
+                  void handleDownloadInvoiceTemplate();
+                  return;
+                }
+                void handleBuildD();
+              }}
             />
         </section>
 
@@ -546,7 +557,6 @@ export function LogisticsWorkbench() {
               </div>
               <div className="overflow-x-auto pb-2">
                 <div className="flex min-w-max gap-4">
-                  <MetricCard label="默认货件标题" value={taskSummary.shipmentTitle} />
                   <MetricCard label="SKU数" value={formatMetricNumber(taskSummary.skuCount)} />
                   <MetricCard label="发货总数" value={formatMetricNumber(taskSummary.totalShipment)} />
                   <MetricCard label="PDF票数" value={formatMetricNumber(taskSummary.pdfCount)} />
@@ -745,9 +755,10 @@ function UploadCard({
   templateDownloadHref?: string;
   isProcessing?: boolean;
 }) {
+  const defaultSupportLabel = title.includes("PDF") ? "支持一次选择多个 PDF" : "支持 Excel";
   const currentFileLabel = multiple
     ? (files?.length ? `${files.length} 个文件已上传` : "支持一次选择多个 PDF")
-    : (file?.name ?? "支持 Excel / PDF");
+    : (file?.name ?? defaultSupportLabel);
   const uploadLabel = multiple ? (files?.length ? "重新上传多个文件" : "点击上传多个文件") : (file ? "重新上传文件" : "点击上传文件");
   const isStaticMode = Boolean(hideActions || templateDownloadLabel || templateDownloadHref);
 
@@ -859,8 +870,7 @@ function TemplateLibraryCard({
       <CardContent className="flex h-[248px] flex-col gap-3 pt-4">
         <div className="flex flex-1 flex-col gap-3">
           <div className="flex h-[102px] shrink-0 flex-col items-center justify-center rounded-xl border border-dashed border-border bg-surface-muted px-4 py-3 text-center">
-            <FileSpreadsheet className="h-12 w-12 text-brand" />
-            <span className="mt-2 text-base font-semibold text-foreground">亚马逊官方模板</span>
+            <span className="text-base font-semibold text-foreground">亚马逊官方模板</span>
             <a
               className="mt-4 inline-flex h-11 items-center gap-2 rounded-xl border border-border bg-white px-5 text-sm font-medium text-foreground transition-colors hover:border-brand hover:text-brand"
               href="#"
@@ -919,6 +929,65 @@ function TemplateLibraryCard({
                 }}
               />
             </label>
+          </div>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+function LogisticsTemplateCard({
+  selectedTemplate,
+  options,
+  status,
+  downloadDisabled,
+  onTemplateChange,
+  onDownload,
+}: {
+  selectedTemplate: string;
+  options: LogisticsTemplateOption[];
+  status?: [string, string];
+  downloadDisabled?: boolean;
+  onTemplateChange: (value: string) => void;
+  onDownload: () => void;
+}) {
+  return (
+    <Card className="h-full min-w-0">
+      <CardHeader>
+        <CardTitle>物流模板 D</CardTitle>
+      </CardHeader>
+      <CardContent className="flex h-[248px] flex-col">
+        <div className="mt-1 flex flex-1 flex-col justify-start rounded-lg border border-dashed border-border bg-surface-muted p-4">
+          <span className="text-sm font-semibold text-foreground">选择物流模板</span>
+          <select
+            className="mt-4 h-11 rounded-xl border border-border bg-white px-3 text-sm text-foreground outline-none transition-colors focus:border-brand"
+            value={selectedTemplate}
+            onChange={(event) => onTemplateChange(event.target.value)}
+          >
+            {options.map((option) => (
+              <option key={option.id} value={option.id} disabled={!option.enabled}>
+                {option.label}
+              </option>
+            ))}
+          </select>
+          <p className="mt-2 text-xs text-muted">当前已接入凯奇模板，选择后会按 PDF 数量批量生成并打包下载</p>
+        </div>
+        <div className="mt-3 flex min-h-[52px] items-start justify-between gap-2">
+          <div className="min-w-0 flex-1 space-y-1">
+            {status ? (
+              <>
+                <Badge tone="green">{status[0]}</Badge>
+                <p className="line-clamp-2 break-all text-xs text-muted">{status[1]}</p>
+              </>
+            ) : (
+              <Badge>待生成</Badge>
+            )}
+          </div>
+          <div className="flex w-[142px] shrink-0 flex-col gap-2">
+            <Button size="sm" className="w-full justify-center whitespace-nowrap" onClick={onDownload} disabled={downloadDisabled}>
+              <Download className="h-4 w-4" />
+              下载发票
+            </Button>
           </div>
         </div>
       </CardContent>
