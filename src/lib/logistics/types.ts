@@ -17,6 +17,10 @@ export type LogisticsLogEntry = {
 export type AProductRow = {
   rowIndex: number;
   image: string;
+  imageAsset?: {
+    extension: string;
+    data: Uint8Array;
+  } | null;
   productName: string;
   asin: string;
   fnsku: string;
@@ -34,6 +38,7 @@ export type AWorkbookSummary = {
   totalRows: number;
   totalBoxes: number;
   totalShipment: number;
+  imageParsingSkipped?: boolean;
   boxHeaders: number[];
   boxWeightKgMap: Record<number, number>;
   boxLengthCmMap: Record<number, number>;
@@ -47,6 +52,12 @@ export type BWorkbookSummary = {
   sheetNames: string[];
   templateSheetName: string | null;
   headerRow: number | null;
+};
+
+export type SaihuWorkbookSummary = {
+  sheetNames: string[];
+  sheetName: string | null;
+  defaultStore: string;
 };
 
 export type CWorkbookSummary = {
@@ -99,18 +110,22 @@ export type NamedWorkbookExportResult = WorkbookExportResult & {
 export type LogisticsWorkspaceState = {
   aFile: UploadedFileState | null;
   bFile: UploadedFileState | null;
+  saihuFile: UploadedFileState | null;
   cFile: UploadedFileState | null;
   dFile: UploadedFileState | null;
   pdfFiles: UploadedFileState[];
   aSummary: AWorkbookSummary | null;
   bSummary: BWorkbookSummary | null;
+  saihuSummary: SaihuWorkbookSummary | null;
   cSummary: CWorkbookSummary | null;
   dSummary: DWorkbookSummary | null;
   pdfSummaries: PdfSummary[];
   bExport: WorkbookExportResult | null;
+  saihuExport: WorkbookExportResult | null;
   cExport: WorkbookExportResult | null;
   cError: string | null;
   summaryExport: WorkbookExportResult | null;
+  compareExport: WorkbookExportResult | null;
   dExports: NamedWorkbookExportResult[];
   logs: LogisticsLogEntry[];
 };

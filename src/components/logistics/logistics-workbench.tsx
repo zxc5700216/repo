@@ -10,43 +10,50 @@ import {
   FileText,
   FileArchive,
   Package,
-  RefreshCw,
   UploadCloud,
 } from "lucide-react";
 import { AppShell } from "@/components/app-shell/app-shell";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { buildBWorkbook, buildCWorkbook, buildDWorkbooks, buildSummaryWorkbook, parseAWorkbook, parseBWorkbook, parseCWorkbook, parseDWorkbook } from "@/lib/logistics/excel";
+import { buildBWorkbook, buildCWorkbook, buildComparisonWorkbook, buildDWorkbooks, buildSaihuWorkbook, parseAWorkbook, parseBWorkbook, parseCWorkbook, parseDWorkbook, parseSaihuWorkbook } from "@/lib/logistics/excel";
 import { parsePdfFile } from "@/lib/logistics/pdf";
 import type { LogisticsLogEntry, LogisticsStatusTone, LogisticsWorkspaceState, UploadedFileState } from "@/lib/logistics/types";
 import { downloadBlob, downloadFilesAsZip, formatMetricNumber, makeId } from "@/lib/logistics/utils";
 
+const SLOW_PARSE_WARNING_BYTES = 30 * 1024 * 1024;
+const HEAVY_PARSE_WARNING_BYTES = 80 * 1024 * 1024;
+
 const initialState: LogisticsWorkspaceState = {
   aFile: null,
   bFile: null,
+  saihuFile: null,
   cFile: null,
   dFile: null,
   pdfFiles: [],
   aSummary: null,
   bSummary: null,
+  saihuSummary: null,
   cSummary: null,
   dSummary: null,
   pdfSummaries: [],
   bExport: null,
+  saihuExport: null,
   cExport: null,
   cError: null,
   summaryExport: null,
+  compareExport: null,
   dExports: [],
   logs: [],
 };
 
-type FileSlot = "a" | "b" | "c" | "d" | "pdf";
+type FileSlot = "a" | "b" | "saihu" | "c" | "d" | "pdf";
 
 export function LogisticsWorkbench() {
   const [state, setState] = useState<LogisticsWorkspaceState>(initialState);
   const [rawFiles, setRawFiles] = useState<Partial<Record<Exclude<FileSlot, "pdf">, File>> & { pdf?: File[] }>({});
   const [busy, setBusy] = useState(false);
+  const [processingSlot, setProcessingSlot] = useState<FileSlot | null>(null);
 
   const pushLog = (entry: Omit<LogisticsLogEntry, "id">) => {
     setState((current) => ({
@@ -63,21 +70,53 @@ export function LogisticsWorkbench() {
 
   const handleFileUpload = async (slot: FileSlot, file: File) => {
     setBusy(true);
+    setProcessingSlot(slot);
     setRawFiles((current) => ({ ...current, [slot]: file }));
 
     try {
       if (slot === "a") {
-        const aSummary = await parseAWorkbook(file);
+        setState((current) => ({
+          ...current,
+          aFile: setUploadedFileState(slot, file),
+          aSummary: null,
+          bExport: null,
+          saihuExport: null,
+          cExport: null,
+          cError: null,
+          summaryExport: null,
+          compareExport: null,
+          dExports: [],
+        }));
+
+        const shouldWarnSlow = file.size > SLOW_PARSE_WARNING_BYTES;
+        const shouldSkipImages = file.size > HEAVY_PARSE_WARNING_BYTES;
+
+        if (shouldWarnSlow) {
+          pushLog({
+            level: "warning",
+            message:
+              file.size > HEAVY_PARSE_WARNING_BYTES
+                ? "A表超过 80MB，建议精简图片或使用服务端处理。本次将优先解析核心数据，暂不立即读取图片。"
+                : "A表超过 30MB，解析可能较慢，请耐心等待。",
+          });
+        }
+
+        const aSummary = await parseAWorkbook(file, { skipImages: shouldSkipImages });
         setState((current) => ({
           ...current,
           aFile: setUploadedFileState(slot, file),
           aSummary,
         }));
-        pushLog({ level: "success", message: `A表已解析，读取最后一个 sheet：${aSummary.latestSheetName}` });
+        pushLog({
+          level: "success",
+          message: aSummary.imageParsingSkipped
+            ? `A表已快速解析，读取最后一个 sheet：${aSummary.latestSheetName}。已跳过图片读取以提升大文件处理速度。`
+            : `A表已解析，读取最后一个 sheet：${aSummary.latestSheetName}`,
+        });
       }
 
       if (slot === "b") {
-        const bSummary = await parseBWorkbook(file);
+        const bSummary = await parseBWorkbook();
         setState((current) => ({
           ...current,
           bFile: setUploadedFileState(slot, file),
@@ -107,10 +146,21 @@ export function LogisticsWorkbench() {
         pushLog({ level: "success", message: `D模板已识别，主模板 sheet：${dSummary.templateSheetName ?? "未知"}` });
       }
 
+      if (slot === "saihu") {
+        const saihuSummary = await parseSaihuWorkbook(file);
+        setState((current) => ({
+          ...current,
+          saihuFile: setUploadedFileState(slot, file),
+          saihuSummary,
+        }));
+        pushLog({ level: "success", message: `赛狐模板已识别，默认店铺值：${saihuSummary.defaultStore || "未识别"}` });
+      }
+
     } catch (error) {
       const message = error instanceof Error ? error.message : "文件解析失败";
       pushLog({ level: "error", message });
     } finally {
+      setProcessingSlot(null);
       setBusy(false);
     }
   };
@@ -142,24 +192,6 @@ export function LogisticsWorkbench() {
     }
   };
 
-  const handleBuildB = async () => {
-    if (!rawFiles.b || !state.aSummary) {
-      pushLog({ level: "warning", message: "生成 B 表前请先上传 A 表和 B 表" });
-      return;
-    }
-
-    setBusy(true);
-    try {
-      const result = await buildBWorkbook(rawFiles.b, state.aSummary);
-      setState((current) => ({ ...current, bExport: result }));
-      pushLog({ level: "success", message: `B表已生成：${result.fileName}` });
-    } catch (error) {
-      pushLog({ level: "error", message: error instanceof Error ? error.message : "生成 B 表失败" });
-    } finally {
-      setBusy(false);
-    }
-  };
-
   const handleBuildC = async () => {
     if (!rawFiles.c || !state.aSummary) {
       pushLog({ level: "warning", message: "生成 C 表前请先上传 A 表和 C 表" });
@@ -185,24 +217,6 @@ export function LogisticsWorkbench() {
     }
   };
 
-  const handleBuildSummary = async () => {
-    if (!state.aSummary) {
-      pushLog({ level: "warning", message: "生成汇总表前请先上传 A 表" });
-      return;
-    }
-
-    setBusy(true);
-    try {
-      const result = await buildSummaryWorkbook(state.aSummary, state.pdfSummaries[0] ?? null);
-      setState((current) => ({ ...current, summaryExport: result }));
-      pushLog({ level: "success", message: `汇总表已生成：${result.fileName}` });
-    } catch (error) {
-      pushLog({ level: "error", message: error instanceof Error ? error.message : "生成汇总表失败" });
-    } finally {
-      setBusy(false);
-    }
-  };
-
   const handleBuildD = async () => {
     if (!rawFiles.d || !state.aSummary || !state.pdfSummaries.length) {
       pushLog({ level: "warning", message: "生成物流发票前请先上传 A 表、D 模板和 PDF" });
@@ -216,6 +230,76 @@ export function LogisticsWorkbench() {
       pushLog({ level: "success", message: `已生成 ${results.length} 个物流发票文件` });
     } catch (error) {
       pushLog({ level: "error", message: error instanceof Error ? error.message : "生成物流发票失败" });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleBuildComparison = async () => {
+    if (!state.aSummary || !state.pdfSummaries.length) {
+      pushLog({ level: "warning", message: "生成创货件对比表前请先上传 A 表和 PDF" });
+      return;
+    }
+
+    setBusy(true);
+    try {
+      const result = await buildComparisonWorkbook(state.aSummary, state.pdfSummaries);
+      setState((current) => ({
+        ...current,
+        compareExport: result,
+      }));
+      pushLog({ level: "success", message: `创货件对比表已生成：${result.fileName}` });
+      downloadBlob(result.blob, result.fileName);
+    } catch (error) {
+      pushLog({ level: "error", message: error instanceof Error ? error.message : "生成创货件对比表失败" });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleBuildB = async (autoDownload = false) => {
+    if (!state.aSummary) {
+      pushLog({ level: "warning", message: "下载 B 表前请先上传 A 表" });
+      return;
+    }
+
+    setBusy(true);
+    try {
+      const result = await buildBWorkbook(state.aSummary);
+      setState((current) => ({
+        ...current,
+        bExport: result,
+      }));
+      pushLog({ level: "success", message: `B表已生成：${result.fileName}` });
+      if (autoDownload) {
+        downloadBlob(result.blob, result.fileName);
+      }
+    } catch (error) {
+      pushLog({ level: "error", message: error instanceof Error ? error.message : "生成 B 表失败" });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleBuildSaihu = async (autoDownload = false) => {
+    if (!rawFiles.saihu || !state.aSummary) {
+      pushLog({ level: "warning", message: "生成赛狐模板前请先上传 A 表和赛狐模板" });
+      return;
+    }
+
+    setBusy(true);
+    try {
+      const result = await buildSaihuWorkbook(rawFiles.saihu, state.aSummary);
+      setState((current) => ({
+        ...current,
+        saihuExport: result,
+      }));
+      pushLog({ level: "success", message: `赛狐模板已生成：${result.fileName}` });
+      if (autoDownload) {
+        downloadBlob(result.blob, result.fileName);
+      }
+    } catch (error) {
+      pushLog({ level: "error", message: error instanceof Error ? error.message : "生成赛狐模板失败" });
     } finally {
       setBusy(false);
     }
@@ -279,6 +363,7 @@ export function LogisticsWorkbench() {
 
   const taskSummary = useMemo(() => {
     const primaryPdfSummary = state.pdfSummaries[0] ?? null;
+    const activeARows = (state.aSummary?.rows ?? []).filter((row) => row.totalShipment > 0);
 
     return {
       shipmentTitle: primaryPdfSummary?.shipmentTitle || "--",
@@ -286,8 +371,8 @@ export function LogisticsWorkbench() {
       warehouseCode: primaryPdfSummary?.warehouseCode || "--",
       fbaCode: primaryPdfSummary?.fbaCode || "--",
       boxCount: primaryPdfSummary?.totalBoxes ?? state.aSummary?.totalBoxes ?? 0,
-      skuCount: state.aSummary?.rows.length ?? 0,
-      totalShipment: state.aSummary?.totalShipment ?? 0,
+      skuCount: activeARows.length,
+      totalShipment: activeARows.reduce((sum, row) => sum + row.totalShipment, 0),
       pdfCount: state.pdfSummaries.length,
       pdfPageCount: state.pdfSummaries.reduce((sum, item) => sum + item.pages.length, 0),
       warningCount: state.logs.filter((item) => item.level === "warning").length,
@@ -295,7 +380,12 @@ export function LogisticsWorkbench() {
     };
   }, [state]);
 
-  const downloadExport = (kind: "bExport" | "cExport" | "summaryExport") => {
+  const visibleARows = useMemo(
+    () => (state.aSummary?.rows ?? []).filter((row) => row.totalShipment > 0),
+    [state.aSummary],
+  );
+
+  const downloadExport = (kind: "bExport" | "saihuExport" | "cExport" | "summaryExport" | "compareExport") => {
     const result = state[kind];
     if (!result) {
       pushLog({ level: "warning", message: "当前还没有可下载的导出文件" });
@@ -319,20 +409,37 @@ export function LogisticsWorkbench() {
               title="装箱表 A"
               description="读取最后一个 sheet，提取 SKU、发货总数、箱号分布"
               file={state.aFile}
-              status={state.aSummary ? ["已识别", `${state.aSummary.latestSheetName}`] : undefined}
+              isProcessing={processingSlot === "a"}
+              status={
+                state.aSummary
+                  ? [
+                      state.aSummary.imageParsingSkipped ? "快速解析" : "已识别",
+                      state.aSummary.imageParsingSkipped
+                        ? `${state.aSummary.latestSheetName}（已跳过图片读取）`
+                        : `${state.aSummary.latestSheetName}`,
+                    ]
+                  : undefined
+              }
               onSelect={(file) => handleFileUpload("a", file)}
             />
-            <UploadCard
-              title="发货模板 B"
-              description="识别亚马逊官方 Create workflow 模板"
-              file={state.bFile}
-              status={state.bSummary ? ["模板", state.bSummary.templateType] : undefined}
-              actionLabel="生成 B 表"
-              actionDisabled={!state.aSummary || !rawFiles.b}
-              onAction={handleBuildB}
-              downloadLabel="下载 B 表"
-              onDownload={() => downloadExport("bExport")}
-              onSelect={(file) => handleFileUpload("b", file)}
+            <TemplateLibraryCard
+              saihuFile={state.saihuFile}
+              saihuSummary={state.saihuSummary}
+              onDownloadB={() => {
+                if (state.bExport) {
+                  downloadExport("bExport");
+                  return;
+                }
+                void handleBuildB(true);
+              }}
+              onSaihuSelect={(file) => handleFileUpload("saihu", file)}
+              onDownloadSaihu={() => {
+                if (state.saihuExport) {
+                  downloadExport("saihuExport");
+                  return;
+                }
+                void handleBuildSaihu(true);
+              }}
             />
             <UploadCard
               title="包装箱表 C"
@@ -380,22 +487,12 @@ export function LogisticsWorkbench() {
             />
         </section>
 
-        <section className="grid gap-4 xl:grid-cols-[1.1fr_0.9fr]">
+        <section className="grid gap-4 xl:grid-cols-[1.15fr_0.85fr]">
           <Card>
-            <CardHeader className="flex flex-row items-center justify-between">
+            <CardHeader>
               <div>
                 <CardTitle>任务总览</CardTitle>
                 <p className="mt-1 text-sm text-muted">根据 PDF 页面解析结果展示货件信息，不再依赖文件名</p>
-              </div>
-              <div className="flex items-center gap-2">
-                <Button variant="secondary" onClick={handleBuildSummary} disabled={!state.aSummary || busy}>
-                  <FileSpreadsheet className="h-4 w-4" />
-                  生成汇总表
-                </Button>
-                <Button variant="primary" onClick={() => downloadExport("summaryExport")} disabled={!state.summaryExport}>
-                  <Download className="h-4 w-4" />
-                  下载汇总表
-                </Button>
               </div>
             </CardHeader>
             <CardContent className="space-y-4">
@@ -461,27 +558,30 @@ export function LogisticsWorkbench() {
 
           <Card>
             <CardHeader>
-              <CardTitle>处理动作</CardTitle>
+              <CardTitle>处理日志</CardTitle>
             </CardHeader>
-            <CardContent className="grid grid-cols-2 gap-3">
-              <Button variant="secondary" disabled={busy} onClick={handleBuildB}>
-                生成 B 表
-              </Button>
-              <Button variant="secondary" disabled={busy} onClick={handleBuildC}>
-                生成 C 表
-              </Button>
-              <Button variant="secondary" disabled={busy} onClick={handleBuildSummary}>
-                生成汇总表
-              </Button>
-              <Button variant="secondary" disabled={busy} onClick={handleBuildD}>
-                生成物流发票
-              </Button>
-              <Button variant="ghost" disabled={busy} onClick={() => setState(initialState)}>
-                <RefreshCw className="h-4 w-4" />
-                清空当前任务
-              </Button>
+            <CardContent className="space-y-2">
+              {state.logs.map((entry) => (
+                <div key={entry.id} className="flex items-start gap-3 rounded-lg border border-border bg-surface-muted px-3 py-3">
+                  {entry.level === "success" ? (
+                    <CheckCircle2 className="mt-0.5 h-4 w-4 text-success" />
+                  ) : entry.level === "warning" ? (
+                    <AlertTriangle className="mt-0.5 h-4 w-4 text-accent" />
+                  ) : entry.level === "error" ? (
+                    <AlertTriangle className="mt-0.5 h-4 w-4 text-danger" />
+                  ) : (
+                    <Eye className="mt-0.5 h-4 w-4 text-info" />
+                  )}
+                  <div className="flex-1">
+                    <Badge tone={toneForLog(entry.level)}>{entry.level}</Badge>
+                    <p className="mt-1 text-sm text-foreground">{entry.message}</p>
+                  </div>
+                </div>
+              ))}
+              {!state.logs.length && <div className="py-10 text-center text-sm text-muted">上传文件或执行生成动作后将在这里记录日志</div>}
             </CardContent>
           </Card>
+
         </section>
 
         <section className="grid gap-4 xl:grid-cols-[1.1fr_0.9fr]">
@@ -506,7 +606,7 @@ export function LogisticsWorkbench() {
                   </tr>
                 </thead>
                 <tbody>
-                  {(state.aSummary?.rows ?? []).slice(0, 12).map((row) => (
+                  {visibleARows.slice(0, 12).map((row) => (
                     <tr key={`${row.sku}-${row.rowIndex}`} className="border-b border-border/70">
                       <td className="px-3 py-3 font-semibold">{row.sku || "--"}</td>
                       <td className="px-3 py-3">{row.productName || "--"}</td>
@@ -516,7 +616,7 @@ export function LogisticsWorkbench() {
                       <td className="px-3 py-3 text-xs text-muted">{Object.entries(row.boxMap).map(([box, qty]) => `${box}:${qty}`).join(" / ") || "--"}</td>
                     </tr>
                   ))}
-                  {!state.aSummary?.rows.length && (
+                  {!visibleARows.length && (
                     <tr>
                       <td colSpan={6} className="px-3 py-10 text-center text-muted">
                         上传 A 表后将在这里展示预览
@@ -529,8 +629,12 @@ export function LogisticsWorkbench() {
           </Card>
 
           <Card>
-            <CardHeader>
+            <CardHeader className="flex flex-row items-center justify-between">
               <CardTitle>PDF 解析列表</CardTitle>
+              <Button variant="secondary" size="sm" onClick={handleBuildComparison} disabled={!state.aSummary || !state.pdfSummaries.length || busy}>
+                <Download className="h-4 w-4" />
+                下载创货件对比表
+              </Button>
             </CardHeader>
             <CardContent className="space-y-3">
               {state.pdfSummaries.map((pdf) => (
@@ -569,6 +673,7 @@ export function LogisticsWorkbench() {
               {!state.pdfSummaries.length && <div className="py-10 text-center text-sm text-muted">上传 PDF 后将在这里展示逐票、逐页解析结果</div>}
             </CardContent>
           </Card>
+
         </section>
 
         <section className="grid gap-4 xl:grid-cols-[0.9fr_1.1fr]">
@@ -578,8 +683,10 @@ export function LogisticsWorkbench() {
             </CardHeader>
             <CardContent className="space-y-3">
               <ExportRow label="B 发货表" ready={Boolean(state.bExport)} onDownload={() => downloadExport("bExport")} />
+              <ExportRow label="赛狐模板" ready={Boolean(state.saihuExport)} onDownload={() => downloadExport("saihuExport")} />
               <ExportRow label="C 包装箱表" ready={Boolean(state.cExport)} onDownload={() => downloadExport("cExport")} />
               <ExportRow label="装箱汇总表" ready={Boolean(state.summaryExport)} onDownload={() => downloadExport("summaryExport")} />
+              <ExportRow label="创货件对比表" ready={Boolean(state.compareExport)} onDownload={() => downloadExport("compareExport")} />
               <ExportRow
                 label="物流发票"
                 ready={Boolean(state.dExports.length)}
@@ -593,31 +700,6 @@ export function LogisticsWorkbench() {
             </CardContent>
           </Card>
 
-          <Card>
-            <CardHeader>
-              <CardTitle>处理日志</CardTitle>
-            </CardHeader>
-            <CardContent className="space-y-2">
-              {state.logs.map((entry) => (
-                <div key={entry.id} className="flex items-start gap-3 rounded-lg border border-border bg-surface-muted px-3 py-3">
-                  {entry.level === "success" ? (
-                    <CheckCircle2 className="mt-0.5 h-4 w-4 text-success" />
-                  ) : entry.level === "warning" ? (
-                    <AlertTriangle className="mt-0.5 h-4 w-4 text-accent" />
-                  ) : entry.level === "error" ? (
-                    <AlertTriangle className="mt-0.5 h-4 w-4 text-danger" />
-                  ) : (
-                    <Eye className="mt-0.5 h-4 w-4 text-info" />
-                  )}
-                  <div className="flex-1">
-                    <Badge tone={toneForLog(entry.level)}>{entry.level}</Badge>
-                    <p className="mt-1 text-sm text-foreground">{entry.message}</p>
-                  </div>
-                </div>
-              ))}
-              {!state.logs.length && <div className="py-10 text-center text-sm text-muted">上传文件或执行生成动作后将在这里记录日志</div>}
-            </CardContent>
-          </Card>
         </section>
       </div>
     </AppShell>
@@ -639,6 +721,10 @@ function UploadCard({
   onAction,
   onDownload,
   multiple,
+  hideActions,
+  templateDownloadLabel,
+  templateDownloadHref,
+  isProcessing,
 }: {
   title: string;
   description: string;
@@ -654,11 +740,16 @@ function UploadCard({
   onDownload?: () => void;
   downloadDisabled?: boolean;
   multiple?: boolean;
+  hideActions?: boolean;
+  templateDownloadLabel?: string;
+  templateDownloadHref?: string;
+  isProcessing?: boolean;
 }) {
   const currentFileLabel = multiple
     ? (files?.length ? `${files.length} 个文件已上传` : "支持一次选择多个 PDF")
     : (file?.name ?? "支持 Excel / PDF");
   const uploadLabel = multiple ? (files?.length ? "重新上传多个文件" : "点击上传多个文件") : (file ? "重新上传文件" : "点击上传文件");
+  const isStaticMode = Boolean(hideActions || templateDownloadLabel || templateDownloadHref);
 
   return (
     <Card className="h-full min-w-0">
@@ -667,51 +758,167 @@ function UploadCard({
       </CardHeader>
       <CardContent className="flex h-[248px] flex-col">
         <p className="text-sm leading-6 text-muted line-clamp-2">{description}</p>
-        <label className="mt-3 flex flex-1 cursor-pointer flex-col items-center justify-center rounded-lg border border-dashed border-border bg-surface-muted px-3 text-center transition-colors hover:border-brand hover:bg-white">
-          <UploadCloud className="h-7 w-7 text-brand" />
-          <span className="mt-2 text-sm font-semibold text-foreground">{uploadLabel}</span>
-          <span className="mt-1 line-clamp-2 max-w-full overflow-hidden text-ellipsis break-all text-xs leading-5 text-muted">{currentFileLabel}</span>
-          <input
-            type="file"
-            className="hidden"
-            accept={title.includes("PDF") ? ".pdf" : ".xlsx,.xls"}
-            multiple={multiple}
-            onChange={(event) => {
-              const selected = Array.from(event.target.files ?? []);
-              if (multiple) {
-                if (selected.length && onSelectMany) {
-                  onSelectMany(selected);
+        {isStaticMode ? (
+          <div className="mt-3 flex flex-1 flex-col items-center justify-center rounded-lg border border-dashed border-border bg-surface-muted px-3 text-center">
+            <FileSpreadsheet className="h-12 w-12 text-brand" />
+            <span className="mt-2 text-sm font-semibold text-foreground" />
+            {templateDownloadHref && templateDownloadLabel ? (
+              <a
+                className="mt-3 inline-flex items-center gap-2 rounded-md border border-border bg-white px-3 py-2 text-xs font-medium text-foreground transition-colors hover:border-brand hover:text-brand"
+                href={templateDownloadHref}
+                download
+              >
+                <Download className="h-4 w-4" />
+                {templateDownloadLabel}
+              </a>
+            ) : templateDownloadLabel ? (
+              <span className="mt-3 inline-flex items-center gap-2 rounded-md border border-dashed border-border bg-white px-3 py-2 text-xs font-medium text-muted">
+                {templateDownloadLabel}
+              </span>
+            ) : null}
+          </div>
+        ) : (
+          <label className="mt-3 flex flex-1 cursor-pointer flex-col items-center justify-center rounded-lg border border-dashed border-border bg-surface-muted px-3 text-center transition-colors hover:border-brand hover:bg-white">
+            <UploadCloud className="h-7 w-7 text-brand" />
+            <span className="mt-2 text-sm font-semibold text-foreground">{uploadLabel}</span>
+            <span className="mt-1 line-clamp-2 max-w-full overflow-hidden text-ellipsis break-all text-xs leading-5 text-muted">{currentFileLabel}</span>
+            <input
+              type="file"
+              className="hidden"
+              accept={title.includes("PDF") ? ".pdf" : ".xlsx,.xls"}
+              multiple={multiple}
+              onChange={(event) => {
+                const selected = Array.from(event.target.files ?? []);
+                if (multiple) {
+                  if (selected.length && onSelectMany) {
+                    onSelectMany(selected);
+                  }
+                } else if (selected[0] && onSelect) {
+                  onSelect(selected[0]);
+                  event.currentTarget.value = "";
                 }
-              } else if (selected[0] && onSelect) {
-                onSelect(selected[0]);
                 event.currentTarget.value = "";
-              }
-              event.currentTarget.value = "";
-            }}
-          />
-        </label>
-        <div className="mt-3 flex min-h-[52px] items-start justify-between gap-2">
-          {status ? (
-            <div className="min-w-0 space-y-1">
-              <Badge tone="green">{status[0]}</Badge>
-              <p className="line-clamp-2 break-all text-xs text-muted">{status[1]}</p>
-            </div>
-          ) : (
-            <Badge>待上传</Badge>
-          )}
-          <div className="flex w-[124px] shrink-0 flex-col gap-2">
+              }}
+            />
+          </label>
+        )}
+        <div className={`mt-3 flex min-h-[52px] items-start justify-between gap-2 ${hideActions ? "invisible" : ""}`}>
+          <div className="min-w-0 flex-1 space-y-2">
+            {status ? (
+              <div className="space-y-1">
+                <Badge tone="green">{status[0]}</Badge>
+                <p className="line-clamp-2 break-all text-xs text-muted">{status[1]}</p>
+              </div>
+            ) : (
+              <Badge>{isProcessing ? "处理中" : "待上传"}</Badge>
+            )}
+            {isProcessing ? (
+              <div className="h-1.5 w-full overflow-hidden rounded-full bg-border/70">
+                <div className="h-full w-2/5 animate-[pulse_1.2s_ease-in-out_infinite] rounded-full bg-brand" />
+              </div>
+            ) : null}
+          </div>
+          <div className="flex w-[142px] shrink-0 flex-col gap-2">
             {onAction && actionLabel ? (
-              <Button size="sm" variant="secondary" className="w-full justify-center" onClick={onAction} disabled={actionDisabled}>
+              <Button size="sm" variant="secondary" className="w-full justify-center whitespace-nowrap" onClick={onAction} disabled={actionDisabled}>
                 <Package className="h-4 w-4" />
                 {actionLabel}
               </Button>
             ) : null}
             {onDownload && downloadLabel ? (
-              <Button size="sm" className="w-full justify-center" onClick={onDownload} disabled={downloadDisabled}>
+              <Button size="sm" className="w-full justify-center whitespace-nowrap" onClick={onDownload} disabled={downloadDisabled}>
                 <Download className="h-4 w-4" />
                 {downloadLabel}
               </Button>
             ) : null}
+          </div>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+function TemplateLibraryCard({
+  saihuFile,
+  saihuSummary,
+  onDownloadB,
+  onSaihuSelect,
+  onDownloadSaihu,
+}: {
+  saihuFile: UploadedFileState | null;
+  saihuSummary: { defaultStore: string } | null;
+  onDownloadB: () => void;
+  onSaihuSelect: (file: File) => void;
+  onDownloadSaihu: () => void;
+}) {
+  return (
+    <Card className="h-full min-w-0">
+      <CardHeader>
+        <CardTitle>发货模板 B</CardTitle>
+      </CardHeader>
+      <CardContent className="flex h-[248px] flex-col gap-3 pt-4">
+        <div className="flex flex-1 flex-col gap-3">
+          <div className="flex h-[102px] shrink-0 flex-col items-center justify-center rounded-xl border border-dashed border-border bg-surface-muted px-4 py-3 text-center">
+            <FileSpreadsheet className="h-12 w-12 text-brand" />
+            <span className="mt-2 text-base font-semibold text-foreground">亚马逊官方模板</span>
+            <a
+              className="mt-4 inline-flex h-11 items-center gap-2 rounded-xl border border-border bg-white px-5 text-sm font-medium text-foreground transition-colors hover:border-brand hover:text-brand"
+              href="#"
+              onClick={(event) => {
+                event.preventDefault();
+                onDownloadB();
+              }}
+            >
+              <Download className="h-4 w-4" />
+              下载官方模板
+            </a>
+          </div>
+          <div className="flex h-[102px] shrink-0 flex-col items-center justify-center rounded-xl border border-dashed border-border bg-surface-muted px-4 py-3 text-center">
+            <FileSpreadsheet className="h-7 w-7 text-brand" />
+            <span className="mt-2 text-base font-semibold text-foreground">赛狐模板</span>
+            <div className="mt-4 flex items-center gap-3">
+              <label className="inline-flex h-11 min-w-[86px] cursor-pointer items-center justify-center gap-2 rounded-xl border border-border bg-white px-4 text-sm font-medium text-foreground transition-colors hover:border-brand hover:text-brand">
+                <UploadCloud className="h-4 w-4" />
+                上传
+                <input
+                  type="file"
+                  className="hidden"
+                  accept=".xlsx,.xls"
+                  onChange={(event) => {
+                    const file = event.target.files?.[0];
+                    if (file) {
+                      onSaihuSelect(file);
+                    }
+                    event.currentTarget.value = "";
+                  }}
+                />
+              </label>
+              <Button size="sm" className="h-11 min-w-[96px] rounded-xl px-4 text-sm font-medium" onClick={onDownloadSaihu} disabled={!saihuFile}>
+                <Download className="h-4 w-4" />
+                下载
+              </Button>
+            </div>
+            <span className="sr-only">
+              {saihuSummary?.defaultStore
+                ? `默认店铺值：${saihuSummary.defaultStore}`
+                : saihuFile?.name ?? "第一列填默认下拉值，第二列 MSKU 对应 A 表 SKU，申报数对应发货总数"}
+            </span>
+            <label className="sr-only">
+              <UploadCloud className="h-4 w-4" />
+              上传赛狐模板
+              <input
+                type="file"
+                className="hidden"
+                accept=".xlsx,.xls"
+                onChange={(event) => {
+                  const file = event.target.files?.[0];
+                  if (file) {
+                    onSaihuSelect(file);
+                  }
+                  event.currentTarget.value = "";
+                }}
+              />
+            </label>
           </div>
         </div>
       </CardContent>

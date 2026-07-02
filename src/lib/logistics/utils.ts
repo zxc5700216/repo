@@ -96,7 +96,10 @@ export function inferPdfMetaFromFileName(fileName: string) {
     }
   }
 
-  if (parts.length > 0) {
+  const channelStartIndex = parts.findIndex((part) => part.endsWith("箱"));
+  if (channelStartIndex >= 0 && channelStartIndex < parts.length - 1) {
+    channelName = parts.slice(channelStartIndex + 1).join("-");
+  } else if (parts.length > 0) {
     channelName = parts.at(-1) ?? "";
   }
 

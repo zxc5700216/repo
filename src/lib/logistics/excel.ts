@@ -1,5 +1,6 @@
 import * as XLSX from "xlsx";
 import JSZip from "jszip";
+import ExcelJS from "exceljs";
 import type {
   AProductRow,
   AWorkbookSummary,
@@ -8,6 +9,7 @@ import type {
   DWorkbookSummary,
   NamedWorkbookExportResult,
   PdfSummary,
+  SaihuWorkbookSummary,
   WorkbookExportResult,
 } from "@/lib/logistics/types";
 import { parseNumber, toText } from "@/lib/logistics/utils";
@@ -16,6 +18,29 @@ type WorkbookWithSheets = {
   workbook: XLSX.WorkBook;
   fileName: string;
 };
+
+type ParseAWorkbookOptions = {
+  skipImages?: boolean;
+};
+
+type ExcelJsMediaItem = {
+  index?: number;
+  buffer?: ArrayBuffer;
+  extension?: string;
+};
+
+type ExcelImageExtension = "jpeg" | "png" | "gif";
+
+function normalizeImageExtension(extension: string): ExcelImageExtension {
+  const normalized = extension.toLowerCase();
+  if (normalized === "jpg" || normalized === "jpeg") {
+    return "jpeg";
+  }
+  if (normalized === "png" || normalized === "gif") {
+    return normalized;
+  }
+  return "png";
+}
 
 export async function readWorkbook(file: File): Promise<WorkbookWithSheets> {
   const buffer = await file.arrayBuffer();
@@ -47,6 +72,79 @@ function columnNumberToName(column: number) {
 function buildCellRef(row: number, col: number) {
   return `${columnNumberToName(col)}${row}`;
 }
+
+function parseBoxNumberFromLabel(label: string, fallback: number) {
+  const matched = label.match(/B(\d+)/iu);
+  if (!matched) {
+    return fallback;
+  }
+  const parsed = Number(matched[1]);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+async function resolveRowImage(row: AProductRow) {
+  if (row.imageAsset) {
+    return {
+      buffer: row.imageAsset.data,
+      extension: normalizeImageExtension(row.imageAsset.extension),
+    };
+  }
+
+  const imageUrl = row.image.trim();
+  if (!/^https?:\/\//iu.test(imageUrl)) {
+    return null;
+  }
+
+  try {
+    const response = await fetch(imageUrl);
+    if (!response.ok) {
+      return null;
+    }
+    const contentType = response.headers.get("content-type") || "";
+    const extension =
+      contentType.includes("png") ? "png" :
+      contentType.includes("webp") ? "png" :
+      "jpeg";
+    return {
+      buffer: new Uint8Array(await response.arrayBuffer()),
+      extension: normalizeImageExtension(extension),
+    };
+  } catch {
+    return null;
+  }
+}
+
+const thinBorder = {
+  top: { style: "thin" as const },
+  left: { style: "thin" as const },
+  bottom: { style: "thin" as const },
+  right: { style: "thin" as const },
+};
+
+const warehouseColorPalette = [
+  "FFD9EAF7",
+  "FFEADCF8",
+  "FFFCE4D6",
+  "FFE2F0D9",
+  "FFFFF2CC",
+  "FFF4CCCC",
+  "FFDDEBF7",
+];
+
+const templateColumnWidths = [15.1640625, 13, 11.5, 10.83203125];
+const templateBoxColumnWidth = 13;
+const templateRowHeights = {
+  1: 16,
+  2: 16,
+  3: 28,
+  4: 17,
+  5: 35,
+  17: 33,
+  18: 29,
+  19: 29,
+  20: 28,
+  21: 28,
+};
 
 function upsertNumericCell(sheetXml: string, cellRef: string, value: number) {
   const rowNumber = Number(cellRef.replace(/^[A-Z]+/u, ""));
@@ -107,7 +205,7 @@ function findPackageCount(matrix: (string | number | null)[][]) {
   return null;
 }
 
-export async function parseAWorkbook(file: File): Promise<AWorkbookSummary> {
+export async function parseAWorkbook(file: File, options: ParseAWorkbookOptions = {}): Promise<AWorkbookSummary> {
   const { workbook } = await readWorkbook(file);
   const latestSheetName = workbook.SheetNames.at(-1) ?? "";
 
@@ -117,6 +215,28 @@ export async function parseAWorkbook(file: File): Promise<AWorkbookSummary> {
 
   const sheet = workbook.Sheets[latestSheetName];
   const matrix = getSheetMatrix(sheet);
+  const excelJsWorkbook = new ExcelJS.Workbook();
+  const imageMap = new Map<number, { extension: string; data: Uint8Array }>();
+
+  if (!options.skipImages) {
+    await excelJsWorkbook.xlsx.load(await file.arrayBuffer());
+    const excelJsSheet = excelJsWorkbook.getWorksheet(latestSheetName);
+
+    if (excelJsSheet?.getImages) {
+      for (const image of excelJsSheet.getImages()) {
+        const imageId = Number(image.imageId);
+        const media = (excelJsWorkbook.model.media as ExcelJsMediaItem[] | undefined)?.find((item) => item.index === imageId);
+        if (!media?.buffer || !media.extension) {
+          continue;
+        }
+        imageMap.set(image.range.tl.nativeRow + 1, {
+          extension: media.extension,
+          data: new Uint8Array(media.buffer),
+        });
+      }
+    }
+  }
+
   const headerRow = (matrix[2] ?? []) as (string | number | null)[];
   const boxHeaders = headerRow
     .map((value, index) => ({ boxNo: parseNumber(value), index }))
@@ -146,6 +266,7 @@ export async function parseAWorkbook(file: File): Promise<AWorkbookSummary> {
     rows.push({
       rowIndex: rowIndex + 1,
       image: toText(row[0]),
+      imageAsset: imageMap.get(rowIndex + 1) ?? null,
       productName: toText(row[1]),
       asin: toText(row[2]),
       fnsku: toText(row[3]),
@@ -182,6 +303,7 @@ export async function parseAWorkbook(file: File): Promise<AWorkbookSummary> {
     totalRows: rows.length,
     totalBoxes: boxHeaders.length,
     totalShipment: rows.reduce((sum, row) => sum + row.totalShipment, 0),
+    imageParsingSkipped: Boolean(options.skipImages),
     boxHeaders,
     boxWeightKgMap: mapBoxMetric(boxWeightRow, 24),
     boxLengthCmMap: mapBoxMetric(boxLengthRow),
@@ -191,15 +313,12 @@ export async function parseAWorkbook(file: File): Promise<AWorkbookSummary> {
   };
 }
 
-export async function parseBWorkbook(file: File): Promise<BWorkbookSummary> {
-  const { workbook } = await readWorkbook(file);
-  const templateSheetName = workbook.SheetNames.find((name) => name.includes("Create workflow")) ?? null;
-
+export async function parseBWorkbook(): Promise<BWorkbookSummary> {
   return {
-    templateType: workbook.SheetNames.includes("Create workflow – template") ? "amazon-official" : "unknown",
-    sheetNames: workbook.SheetNames,
-    templateSheetName,
-    headerRow: workbook.SheetNames.includes("Create workflow – template") ? 6 : null,
+    templateType: "amazon-official",
+    sheetNames: ["Create workflow – template"],
+    templateSheetName: "Create workflow – template",
+    headerRow: 6,
   };
 }
 
@@ -248,6 +367,24 @@ export async function parseCWorkbook(file: File): Promise<CWorkbookSummary> {
   };
 }
 
+export async function parseSaihuWorkbook(file: File): Promise<SaihuWorkbookSummary> {
+  const { workbook } = await readWorkbook(file);
+  const sheetName = workbook.SheetNames[0] ?? null;
+  if (!sheetName) {
+    throw new Error("赛狐模板没有可读取的 sheet");
+  }
+
+  const sheet = workbook.Sheets[sheetName];
+  const matrix = getSheetMatrix(sheet);
+  const defaultStore = toText(matrix[1]?.[0]) || toText(matrix[0]?.[0]) || "";
+
+  return {
+    sheetNames: workbook.SheetNames,
+    sheetName,
+    defaultStore,
+  };
+}
+
 export async function parseDWorkbook(file: File): Promise<DWorkbookSummary> {
   const { workbook } = await readWorkbook(file);
 
@@ -258,8 +395,13 @@ export async function parseDWorkbook(file: File): Promise<DWorkbookSummary> {
   };
 }
 
-export async function buildBWorkbook(file: File, aSummary: AWorkbookSummary): Promise<WorkbookExportResult> {
-  const buffer = await file.arrayBuffer();
+export async function buildBWorkbook(aSummary: AWorkbookSummary): Promise<WorkbookExportResult> {
+  const response = await fetch("/logistics-templates/ManifestFileUpload_Template_IncludeCasePack_IncludeExpirationDate_IncludeMLC_MPL.xlsx");
+  if (!response.ok) {
+    throw new Error("未找到内置的亚马逊官方 Create workflow 模板");
+  }
+
+  const buffer = await response.arrayBuffer();
   const workbook = XLSX.read(buffer, { type: "array" });
   const sheetName = "Create workflow – template";
   const sheet = workbook.Sheets[sheetName];
@@ -281,7 +423,7 @@ export async function buildBWorkbook(file: File, aSummary: AWorkbookSummary): Pr
   const output = XLSX.write(workbook, { type: "array", bookType: "xlsx" });
 
   return {
-    fileName: `B_已填写_${Date.now()}.xlsx`,
+    fileName: "ManifestFileUpload_Template_IncludeCasePack_IncludeExpirationDate_IncludeMLC_MPL.xlsx",
     blob: new Blob([output], {
       type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     }),
@@ -399,6 +541,37 @@ export async function buildCWorkbook(file: File, aSummary: AWorkbookSummary): Pr
   };
 }
 
+export async function buildSaihuWorkbook(file: File, aSummary: AWorkbookSummary): Promise<WorkbookExportResult> {
+  const buffer = await file.arrayBuffer();
+  const workbook = XLSX.read(buffer, { type: "array", cellDates: true, cellHTML: false, cellFormula: true });
+  const sheetName = workbook.SheetNames[0];
+
+  if (!sheetName) {
+    throw new Error("赛狐模板缺少可用工作表");
+  }
+
+  const sheet = workbook.Sheets[sheetName];
+  const matrix = getSheetMatrix(sheet);
+  const defaultStore = toText(matrix[1]?.[0]) || toText(matrix[0]?.[0]) || "";
+  const rows = aSummary.rows.filter((row) => row.totalShipment > 0);
+
+  const dataRows = rows.map((row) => [defaultStore, row.sku, row.totalShipment, ""]);
+  const rebuiltSheet = XLSX.utils.aoa_to_sheet([
+    matrix[0] ?? ["*店铺", "*MSKU", "*申报数", "商品有效期（YYYY/MM/DD）"],
+    ...dataRows,
+  ]);
+  workbook.Sheets[sheetName] = rebuiltSheet;
+
+  const output = XLSX.write(workbook, { type: "array", bookType: "xlsx" });
+
+  return {
+    fileName: file.name,
+    blob: new Blob([output], {
+      type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    }),
+  };
+}
+
 export async function buildSummaryWorkbook(aSummary: AWorkbookSummary, pdfSummary: PdfSummary | null): Promise<WorkbookExportResult> {
   const workbook = XLSX.utils.book_new();
   const boxHeaders = aSummary.boxHeaders.map((boxNo) => String(boxNo));
@@ -441,6 +614,258 @@ export async function buildSummaryWorkbook(aSummary: AWorkbookSummary, pdfSummar
   return {
     fileName: `装箱汇总表_${Date.now()}.xlsx`,
     blob: new Blob([output], {
+      type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    }),
+  };
+}
+
+export async function buildComparisonWorkbook(aSummary: AWorkbookSummary, pdfSummaries: PdfSummary[]): Promise<WorkbookExportResult> {
+  const response = await fetch("/logistics-templates/6.30-%E5%88%9B%E8%B4%A7%E4%BB%B6%E5%AF%B9%E6%AF%94%E8%A1%A8.xlsx");
+  if (!response.ok) {
+    throw new Error("未找到内置的创货件对比表模板");
+  }
+
+  const buffer = await response.arrayBuffer();
+  const workbook = new ExcelJS.Workbook();
+  await workbook.xlsx.load(buffer);
+  const worksheet = workbook.getWorksheet("优化货件") ?? workbook.worksheets[0];
+
+  if (!worksheet) {
+    throw new Error("创货件对比表模板缺少可用工作表");
+  }
+
+  const shippedRows = aSummary.rows.filter((row) => row.totalShipment > 0);
+  const pages = pdfSummaries.flatMap((pdf) =>
+    pdf.pages.map((page) => {
+      const columnLabel = page.positionCode || `P1-B${page.pageNumber}`;
+      return {
+        ...page,
+        warehouseCode: page.warehouseCode || pdf.warehouseCode,
+        shipmentName: page.shipmentName || pdf.shipmentName,
+        weightKg: aSummary.boxWeightKgMap[page.pageNumber] ?? 0,
+        columnLabel,
+        channelName: pdf.channelName || "",
+        boxNo: parseBoxNumberFromLabel(columnLabel, page.pageNumber),
+      };
+    }),
+  );
+  const sortedBoxNos = [...aSummary.boxHeaders].sort((left, right) => left - right);
+  const pageByBoxNo = new Map<number, (typeof pages)[number]>();
+  pages.forEach((page) => {
+    if (!pageByBoxNo.has(page.boxNo)) {
+      pageByBoxNo.set(page.boxNo, page);
+    }
+  });
+
+  const boxColumns = sortedBoxNos.map((boxNo) => {
+    const page = pageByBoxNo.get(boxNo);
+    return {
+      boxNo,
+      weightKg: aSummary.boxWeightKgMap[boxNo] ?? 0,
+      warehouseCode: page?.warehouseCode || "",
+      shipmentName: page?.shipmentName || "",
+      channelName: page?.channelName || "",
+      columnLabel: page?.columnLabel || `P1-B${boxNo}`,
+    };
+  });
+  const warehouseFillMap = new Map<string, string>();
+  let paletteIndex = 0;
+  boxColumns.forEach((column) => {
+    const key = column.warehouseCode || "__empty__";
+    if (!warehouseFillMap.has(key)) {
+      warehouseFillMap.set(key, warehouseColorPalette[paletteIndex % warehouseColorPalette.length]);
+      paletteIndex += 1;
+    }
+  });
+
+  const headerEndColumn = 4 + boxColumns.length;
+  const dataStartRow = 6;
+  const templateDataStartRow = 6;
+  const templateDataEndRow = 16;
+  const templateTailStartRow = 17;
+  const baseColumnCount = 4;
+  const templateMaxColumn = Math.max(worksheet.columnCount, 45);
+  const lastTemplateDataColumn = Math.max(templateMaxColumn, headerEndColumn);
+  const extraRowCount = Math.max(shippedRows.length - (templateDataEndRow - templateDataStartRow + 1), 0);
+
+  if (extraRowCount > 0) {
+    worksheet.spliceRows(templateTailStartRow, 0, ...Array.from({ length: extraRowCount }, () => []));
+  }
+
+  const tailStartRow = templateTailStartRow + extraRowCount;
+  const logisticsChannelRow = tailStartRow;
+  const logisticsPriceRow = tailStartRow + 1;
+  const logisticsFeeRow = tailStartRow + 2;
+  const inboundFeeRow = tailStartRow + 3;
+  const totalFeeRow = tailStartRow + 4;
+
+  for (let columnNumber = 1; columnNumber <= Math.max(templateMaxColumn, headerEndColumn); columnNumber += 1) {
+    const currentWidth = worksheet.getColumn(columnNumber).width;
+    if (columnNumber <= baseColumnCount) {
+      worksheet.getColumn(columnNumber).width = currentWidth ?? templateColumnWidths[columnNumber - 1] ?? 12;
+      continue;
+    }
+    worksheet.getColumn(columnNumber).width = currentWidth ?? templateBoxColumnWidth;
+  }
+
+  worksheet.getCell("D1").value = "重量/kg";
+  worksheet.getCell("D2").value = "数量";
+  worksheet.getCell("D3").value = "仓库名称";
+  worksheet.getCell("D4").value = "货件号";
+  worksheet.getCell("A5").value = "产品图片";
+  worksheet.getCell("B5").value = "品名";
+  worksheet.getCell("C5").value = "SKU";
+  worksheet.getCell("D5").value = "最终发货";
+
+  for (let columnNumber = 5; columnNumber <= templateMaxColumn; columnNumber += 1) {
+    const columnName = columnNumberToName(columnNumber);
+    const isUsed = columnNumber <= headerEndColumn;
+    worksheet.getCell(`${columnName}1`).value = isUsed ? "" : null;
+    worksheet.getCell(`${columnName}2`).value = isUsed ? "" : null;
+    worksheet.getCell(`${columnName}3`).value = isUsed ? "" : null;
+    worksheet.getCell(`${columnName}4`).value = isUsed ? "" : null;
+    worksheet.getCell(`${columnName}5`).value = isUsed ? "" : null;
+  }
+
+  boxColumns.forEach((column, pageIndex) => {
+    const columnNumber = 5 + pageIndex;
+    const columnName = columnNumberToName(columnNumber);
+    worksheet.getCell(`${columnName}1`).value = column.weightKg || "";
+    worksheet.getCell(`${columnName}2`).value = {
+      formula: `SUM(${columnName}${dataStartRow}:${columnName}${dataStartRow + shippedRows.length - 1})`,
+    };
+    worksheet.getCell(`${columnName}3`).value = column.warehouseCode || "--";
+    worksheet.getCell(`${columnName}4`).value = column.shipmentName || "--";
+    worksheet.getCell(`${columnName}5`).value = column.columnLabel;
+  });
+
+  for (let rowNumber = dataStartRow; rowNumber < tailStartRow; rowNumber += 1) {
+    worksheet.getCell(`A${rowNumber}`).value = "";
+    worksheet.getCell(`B${rowNumber}`).value = "";
+    worksheet.getCell(`C${rowNumber}`).value = "";
+    worksheet.getCell(`D${rowNumber}`).value = "";
+    for (let columnNumber = 5; columnNumber <= lastTemplateDataColumn; columnNumber += 1) {
+      worksheet.getCell(rowNumber, columnNumber).value = "";
+    }
+  }
+
+  shippedRows.forEach((row, index) => {
+    const rowNumber = dataStartRow + index;
+    worksheet.getCell(`A${rowNumber}`).value = "";
+    worksheet.getCell(`B${rowNumber}`).value = row.productName || "";
+    worksheet.getCell(`C${rowNumber}`).value = row.sku || "";
+    worksheet.getCell(`D${rowNumber}`).value = {
+      formula: `SUM(E${rowNumber}:${columnNumberToName(headerEndColumn)}${rowNumber})`,
+    };
+    boxColumns.forEach(({ boxNo }, pageIndex) => {
+      worksheet.getCell(rowNumber, 5 + pageIndex).value = row.boxMap[boxNo] ?? "";
+    });
+  });
+
+  for (let rowNumber = tailStartRow; rowNumber <= totalFeeRow; rowNumber += 1) {
+    for (let columnNumber = 5; columnNumber <= templateMaxColumn; columnNumber += 1) {
+      worksheet.getCell(rowNumber, columnNumber).value = columnNumber <= headerEndColumn ? worksheet.getCell(rowNumber, columnNumber).value : "";
+    }
+  }
+
+  worksheet.getCell(`D${logisticsChannelRow}`).value = "物流渠道";
+  worksheet.getCell(`D${logisticsPriceRow}`).value = "物流单价";
+  worksheet.getCell(`D${logisticsFeeRow}`).value = "物流费用";
+  worksheet.getCell(`D${inboundFeeRow}`).value = "入库配置费（美金）";
+  worksheet.getCell(`D${totalFeeRow}`).value = "总费用";
+
+  boxColumns.forEach((column, pageIndex) => {
+    const columnNumber = 5 + pageIndex;
+    const columnName = columnNumberToName(columnNumber);
+    worksheet.getCell(`${columnName}${logisticsChannelRow}`).value = column.channelName || "--";
+    worksheet.getCell(`${columnName}${logisticsPriceRow}`).value = "";
+    worksheet.getCell(`${columnName}${logisticsFeeRow}`).value = {
+      formula: `${columnName}${logisticsPriceRow}*${columnName}1`,
+    };
+    worksheet.getCell(`${columnName}${inboundFeeRow}`).value = pageIndex === 0 ? 0 : "";
+  });
+
+  if (boxColumns.length) {
+    worksheet.getCell(`E${totalFeeRow}`).value = {
+      formula: `SUM(E${logisticsFeeRow}:${columnNumberToName(headerEndColumn)}${logisticsFeeRow})+E${inboundFeeRow}*7.2`,
+    };
+  }
+
+  Object.entries(templateRowHeights).forEach(([rowNumber, height]) => {
+    worksheet.getRow(Number(rowNumber)).height = height;
+  });
+
+  shippedRows.forEach((_, index) => {
+    const rowNumber = dataStartRow + index;
+    const cycleHeights = [69, 79, 87];
+    worksheet.getRow(rowNumber).height = worksheet.getRow(rowNumber).height ?? cycleHeights[index % cycleHeights.length];
+  });
+
+  for (let rowNumber = templateDataEndRow + 1; rowNumber < tailStartRow; rowNumber += 1) {
+    worksheet.getRow(rowNumber).height = worksheet.getRow(templateDataEndRow).height ?? 72;
+  }
+
+  worksheet.getRow(logisticsChannelRow).height = worksheet.getRow(templateTailStartRow).height ?? 33;
+  worksheet.getRow(logisticsPriceRow).height = worksheet.getRow(templateTailStartRow + 1).height ?? 29;
+  worksheet.getRow(logisticsFeeRow).height = worksheet.getRow(templateTailStartRow + 2).height ?? 29;
+  worksheet.getRow(inboundFeeRow).height = worksheet.getRow(templateTailStartRow + 3).height ?? 28;
+  worksheet.getRow(totalFeeRow).height = worksheet.getRow(templateTailStartRow + 4).height ?? 28;
+
+  boxColumns.forEach((column, pageIndex) => {
+    const columnNumber = 5 + pageIndex;
+    const color = warehouseFillMap.get(column.warehouseCode || "__empty__") || "FFE2F0D9";
+    [3, 4].forEach((rowNumber) => {
+      worksheet.getCell(rowNumber, columnNumber).fill = {
+        type: "pattern",
+        pattern: "solid",
+        fgColor: { argb: color },
+      };
+    });
+    worksheet.getCell(5, columnNumber).fill = {
+      type: "pattern",
+      pattern: "solid",
+      fgColor: { argb: "FF92D050" },
+    };
+    worksheet.getCell(5, columnNumber).numFmt = "@";
+  });
+
+  for (let rowNumber = 1; rowNumber <= totalFeeRow; rowNumber += 1) {
+    for (let columnNumber = 4; columnNumber <= headerEndColumn; columnNumber += 1) {
+      worksheet.getCell(rowNumber, columnNumber).border = thinBorder;
+    }
+  }
+
+  for (let columnNumber = 1; columnNumber <= 3; columnNumber += 1) {
+    for (let rowNumber = 5; rowNumber < tailStartRow; rowNumber += 1) {
+      worksheet.getCell(rowNumber, columnNumber).border = thinBorder;
+    }
+  }
+
+  worksheet.getCell(`D${totalFeeRow}`).font = { bold: true, color: { argb: "FFFF0000" } };
+  if (boxColumns.length) {
+    worksheet.getCell(`E${totalFeeRow}`).font = { bold: true, color: { argb: "FFFF0000" } };
+  }
+
+  for (const [rowIndex, row] of shippedRows.entries()) {
+    const resolvedImage = await resolveRowImage(row);
+    if (!resolvedImage) {
+      continue;
+    }
+    const imageId = workbook.addImage({
+      base64: Buffer.from(resolvedImage.buffer).toString("base64"),
+      extension: resolvedImage.extension,
+    });
+    const targetRow = 6 + rowIndex;
+    worksheet.addImage(imageId, {
+      tl: { col: 0.12, row: targetRow - 1 + 0.08 },
+      ext: { width: 56, height: 56 },
+      editAs: "oneCell",
+    });
+  }
+
+  return {
+    fileName: `创货件对比表_${Date.now()}.xlsx`,
+    blob: new Blob([await workbook.xlsx.writeBuffer()], {
       type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     }),
   };

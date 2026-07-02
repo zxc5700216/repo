@@ -2,13 +2,82 @@ import type { PdfPageSummary, PdfSummary } from "@/lib/logistics/types";
 import { inferPdfMetaFromFileName } from "@/lib/logistics/utils";
 import { inflate } from "pako";
 
+type PdfTextItem = {
+  str?: string;
+};
+
+type PdfDocumentProxy = {
+  numPages: number;
+  getPage(pageNumber: number): Promise<{
+    getTextContent(options?: { includeMarkedContent?: boolean }): Promise<{
+      items: PdfTextItem[];
+    }>;
+  }>;
+  destroy?(): Promise<void>;
+};
+
+type PdfJsModule = {
+  getDocument(options: {
+    data: Uint8Array;
+    disableWorker?: boolean;
+    useWorkerFetch?: boolean;
+    isEvalSupported?: boolean;
+  }): {
+    promise: Promise<PdfDocumentProxy>;
+  };
+};
+
+async function loadPdfJs(): Promise<PdfJsModule> {
+  return import("pdfjs-dist/legacy/build/pdf.mjs") as unknown as Promise<PdfJsModule>;
+}
+
 function escapeRegExp(value: string) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+function bytesToBinaryString(bytes: Uint8Array) {
+  let result = "";
+  const chunkSize = 0x8000;
+
+  for (let index = 0; index < bytes.length; index += chunkSize) {
+    const chunk = bytes.subarray(index, index + chunkSize);
+    result += String.fromCharCode(...chunk);
+  }
+
+  return result;
+}
+
 function decodePdfString(buffer: ArrayBuffer) {
-  const decoder = new TextDecoder("latin1");
-  return decoder.decode(buffer);
+  return bytesToBinaryString(new Uint8Array(buffer));
+}
+
+async function extractPdfPageTexts(buffer: ArrayBuffer) {
+  try {
+    const { getDocument } = await loadPdfJs();
+    const loadingTask = getDocument({
+      data: new Uint8Array(buffer),
+      disableWorker: true,
+      useWorkerFetch: false,
+      isEvalSupported: false,
+    });
+    const pdf = await loadingTask.promise;
+    const pageTexts: string[] = [];
+
+    for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
+      const page = await pdf.getPage(pageNumber);
+      const content = await page.getTextContent({ includeMarkedContent: false });
+      const text = content.items
+        .map((item) => item.str?.trim() ?? "")
+        .filter(Boolean)
+        .join(" ");
+      pageTexts.push(normalizePdfText(text));
+    }
+
+    await pdf.destroy?.();
+    return pageTexts;
+  } catch {
+    return [];
+  }
 }
 
 function decodeUtf16BeWithFallback(value: string) {
@@ -41,7 +110,7 @@ function extractPdfStreamCandidates(buffer: ArrayBuffer) {
 
     let inflatedText = "";
     try {
-      inflatedText = new TextDecoder("latin1").decode(inflate(streamBytes));
+      inflatedText = bytesToBinaryString(inflate(streamBytes));
     } catch {
       continue;
     }
@@ -67,7 +136,7 @@ function extractPdfStreamCandidates(buffer: ArrayBuffer) {
 function findShipmentTitleInText(text: string) {
   const normalized = normalizePdfText(text).replace(/[—–]/g, "-");
   const patterns = [
-    /货件\d+-[A-Z]{3,5}\d*-FBA[A-Z0-9]+-\d+箱-[\u4e00-\u9fffA-Za-z0-9]+/u,
+    /货件\d+-[A-Z]{3,5}\d*-FBA[A-Z0-9]+-\d+箱-[\u4e00-\u9fffA-Za-z0-9-]+/u,
     /货件\d+-[A-Z]{3,5}\d*-FBA[A-Z0-9]+-\d+箱-[^\s()]+/u,
   ];
 
@@ -96,6 +165,24 @@ function extractShipmentTitleFromStream(buffer: ArrayBuffer) {
 function matchFirst(text: string, pattern: RegExp) {
   const matched = text.match(pattern);
   return matched?.[1] ?? "";
+}
+
+function extractPositionCode(text: string) {
+  const normalized = normalizePdfText(text).toUpperCase();
+  const patterns = [
+    /\b(P\s*\d+\s*-\s*B\s*\d+)\b/u,
+    /\b(P\s*\d+\s*B\s*\d+)\b/u,
+    /\b(PAGE\s*\d+\s*-\s*BOX\s*\d+)\b/u,
+  ];
+
+  for (const pattern of patterns) {
+    const matched = normalized.match(pattern)?.[1];
+    if (matched) {
+      return matched.replace(/\s+/g, "").replace("PAGE", "P").replace("BOX", "B");
+    }
+  }
+
+  return "";
 }
 
 function normalizePdfText(text: string) {
@@ -196,23 +283,36 @@ function extractPageSummaries(
   pdfText: string,
   sharedMeta: { shipmentName: string; warehouseCode: string; fbaCode: string },
   pageCount: number,
+  pageTexts: string[],
+  streamCandidates: string[],
 ) {
   const pages: PdfPageSummary[] = [];
-  const boxMatches = Array.from(pdfText.matchAll(/(FBA[A-Z0-9]+U\d{6})/g)).map((item) => item[1]);
-  const positionMatches = Array.from(pdfText.matchAll(/(P\d+\s*-\s*B\d+)/g)).map((item) => item[1]);
-  const skuTypeMatches = Array.from(pdfText.matchAll(/(Single SKU|Mixed SKUs)/g)).map((item) => item[1]);
-  const qtyMatches = Array.from(pdfText.matchAll(/Qty\s*(\d+)/g)).map((item) => Number(item[1]));
+  const globalBoxMatches = Array.from(pdfText.matchAll(/(FBA[A-Z0-9]+U\d{6})/g)).map((item) => item[1]);
+  const globalSkuTypeMatches = Array.from(pdfText.matchAll(/(Single SKU|Mixed SKUs)/g)).map((item) => item[1]);
+  const globalQtyMatches = Array.from(pdfText.matchAll(/Qty\s*(\d+)/g)).map((item) => Number(item[1]));
+  const globalPositionMatches = streamCandidates.map((candidate) => extractPositionCode(candidate)).filter(Boolean);
 
   for (let index = 0; index < pageCount; index += 1) {
-    const fbaBoxCode = boxMatches[index] ?? (sharedMeta.fbaCode ? `${sharedMeta.fbaCode}U${String(index + 1).padStart(6, "0")}` : "");
+    const pageText = pageTexts[index] ?? "";
+    const pageBoxCode = pageText.match(/(FBA[A-Z0-9]+U\d{6})/u)?.[1] ?? "";
+    const pagePositionCode = extractPositionCode(pageText);
+    const pageSkuType = pageText.match(/(Single SKU|Mixed SKUs)/u)?.[1] ?? "";
+    const pageQty = pageText.match(/Qty\s*(\d+)/u)?.[1];
 
-    const skuType = skuTypeMatches[index] ?? "";
-    const qty = qtyMatches[index] ?? null;
-    const positionCode = positionMatches[index] ?? "";
+    const fbaBoxCode =
+      pageBoxCode ||
+      globalBoxMatches[index] ||
+      (sharedMeta.fbaCode ? `${sharedMeta.fbaCode}U${String(index + 1).padStart(6, "0")}` : "");
+
+    const skuType = pageSkuType || globalSkuTypeMatches[index] || "";
+    const qty = pageQty ? Number(pageQty) : (globalQtyMatches[index] ?? null);
+    const positionCode = pagePositionCode || globalPositionMatches[index] || "";
 
     let sku = "";
     if (skuType === "Single SKU") {
-      const localText = pdfText.slice(Math.max(0, (pdfText.indexOf(fbaBoxCode) || 0) - 400), Math.min(pdfText.length, (pdfText.indexOf(fbaBoxCode) || 0) + 800));
+      const localText =
+        pageText ||
+        pdfText.slice(Math.max(0, (pdfText.indexOf(fbaBoxCode) || 0) - 400), Math.min(pdfText.length, (pdfText.indexOf(fbaBoxCode) || 0) + 800));
       const skuPattern = /Single SKU[\s\S]{0,120}?([A-Z0-9][A-Z0-9\- ]{2,})[\r\n]/;
       sku = matchFirst(localText, skuPattern).trim();
     }
@@ -236,15 +336,17 @@ function extractPageSummaries(
 
 export async function parsePdfFile(file: File): Promise<PdfSummary> {
   const buffer = await file.arrayBuffer();
+  const streamCandidates = extractPdfStreamCandidates(buffer);
   const streamShipmentTitle = extractShipmentTitleFromStream(buffer);
   const pdfText = decodePdfString(buffer);
+  const pageTexts = await extractPdfPageTexts(buffer);
   const parsedPageCount = getPageCount(pdfText);
   const sharedMeta =
     (streamShipmentTitle ? buildMetaFromShipmentTitle(streamShipmentTitle) : null) ??
     extractGlobalMeta(pdfText, file.name);
 
-  const pageCount = sharedMeta.totalBoxes && Number.isFinite(sharedMeta.totalBoxes) ? sharedMeta.totalBoxes : parsedPageCount;
-  const pages = extractPageSummaries(pdfText, sharedMeta, pageCount);
+  const pageCount = pageTexts.length || (sharedMeta.totalBoxes && Number.isFinite(sharedMeta.totalBoxes) ? sharedMeta.totalBoxes : parsedPageCount);
+  const pages = extractPageSummaries(pdfText, sharedMeta, pageCount, pageTexts, streamCandidates);
   const renamedFileName = `${sharedMeta.shipmentTitle || `${sharedMeta.shipmentName}-${sharedMeta.warehouseCode}-${sharedMeta.fbaCode}-${pageCount}箱`}.pdf`
     .replace(/\.pdf\.pdf$/i, ".pdf")
     .replace(/^-+|-+$/g, "");
