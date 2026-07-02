@@ -1,5 +1,6 @@
 import type { PdfPageSummary, PdfSummary } from "@/lib/logistics/types";
 import { inferPdfMetaFromFileName } from "@/lib/logistics/utils";
+import { getDocument } from "pdfjs-dist";
 
 function escapeRegExp(value: string) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -8,6 +9,32 @@ function escapeRegExp(value: string) {
 function decodePdfString(buffer: ArrayBuffer) {
   const decoder = new TextDecoder("latin1");
   return decoder.decode(buffer);
+}
+
+async function extractPdfText(buffer: ArrayBuffer) {
+  const fallbackText = decodePdfString(buffer);
+
+  try {
+    const loadingTask = getDocument({ data: buffer });
+    const pdf = await loadingTask.promise;
+    const pageTexts: string[] = [];
+
+    for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
+      const page = await pdf.getPage(pageNumber);
+      const content = await page.getTextContent();
+      const text = content.items
+        .map((item) => ("str" in item ? item.str : ""))
+        .filter(Boolean)
+        .join(" ");
+      pageTexts.push(text);
+    }
+
+    await loadingTask.destroy();
+    const extractedText = pageTexts.join("\n");
+    return extractedText.trim() ? extractedText : fallbackText;
+  } catch {
+    return fallbackText;
+  }
 }
 
 function matchFirst(text: string, pattern: RegExp) {
@@ -177,7 +204,7 @@ function extractPageSummaries(
 
 export async function parsePdfFile(file: File): Promise<PdfSummary> {
   const buffer = await file.arrayBuffer();
-  const pdfText = decodePdfString(buffer);
+  const pdfText = await extractPdfText(buffer);
   const parsedPageCount = getPageCount(pdfText);
   const sharedMeta = extractGlobalMeta(pdfText, file.name);
   const pageCount = sharedMeta.totalBoxes && Number.isFinite(sharedMeta.totalBoxes) ? sharedMeta.totalBoxes : parsedPageCount;
