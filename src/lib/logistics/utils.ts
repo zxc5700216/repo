@@ -40,6 +40,18 @@ export function downloadBlob(blob: Blob, fileName: string) {
   URL.revokeObjectURL(url);
 }
 
+export async function downloadFilesAsZip(files: { fileName: string; blob: Blob }[], archiveName: string) {
+  const JSZipModule = await import("jszip");
+  const zip = new JSZipModule.default();
+
+  files.forEach((file) => {
+    zip.file(file.fileName, file.blob);
+  });
+
+  const blob = await zip.generateAsync({ type: "blob" });
+  downloadBlob(blob, archiveName);
+}
+
 export function formatMetricNumber(value: number | null | undefined, digits = 0) {
   if (value === null || value === undefined || Number.isNaN(value)) {
     return "--";

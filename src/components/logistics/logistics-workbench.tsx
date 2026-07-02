@@ -20,7 +20,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { buildBWorkbook, buildCWorkbook, buildDWorkbooks, buildSummaryWorkbook, parseAWorkbook, parseBWorkbook, parseCWorkbook, parseDWorkbook } from "@/lib/logistics/excel";
 import { parsePdfFile } from "@/lib/logistics/pdf";
 import type { LogisticsLogEntry, LogisticsStatusTone, LogisticsWorkspaceState, UploadedFileState } from "@/lib/logistics/types";
-import { downloadBlob, formatMetricNumber, makeId } from "@/lib/logistics/utils";
+import { downloadBlob, downloadFilesAsZip, formatMetricNumber, makeId } from "@/lib/logistics/utils";
 
 const initialState: LogisticsWorkspaceState = {
   aFile: null,
@@ -239,11 +239,27 @@ export function LogisticsWorkbench() {
       return;
     }
 
-    const firstFile = files[0];
-    const firstSummary = state.pdfSummaries[0];
-    if (firstFile && firstSummary) {
-      downloadBlob(firstFile, firstSummary.renamedFileName);
+    const renamedFiles = files
+      .map((file, fileIndex) => {
+        const summary = state.pdfSummaries[fileIndex];
+        if (!summary) {
+          return null;
+        }
+
+        return {
+          fileName: summary.renamedFileName,
+          blob: file,
+        };
+      })
+      .filter(Boolean) as { fileName: string; blob: Blob }[];
+
+    if (!renamedFiles.length) {
+      pushLog({ level: "warning", message: "没有可下载的 PDF 文件" });
+      return;
     }
+
+    await downloadFilesAsZip(renamedFiles, `箱唛PDF_${Date.now()}.zip`);
+    pushLog({ level: "success", message: `已打包下载 ${renamedFiles.length} 个重命名后的箱唛 PDF` });
   };
 
   const handleDownloadInvoiceTemplate = async (index?: number) => {
@@ -344,7 +360,7 @@ export function LogisticsWorkbench() {
               description="读取 PDF 页面中的货件号、仓库、FBA 编号，箱数按页数计算"
               files={state.pdfFiles}
               status={state.pdfSummaries.length ? ["票数", String(state.pdfSummaries.length)] : undefined}
-              downloadLabel="下载箱唛"
+              downloadLabel="下载全部箱唛"
               onDownload={() => handleDownloadRenamedPdf()}
               onSelectMany={(files) => handlePdfUploads(files)}
               multiple
