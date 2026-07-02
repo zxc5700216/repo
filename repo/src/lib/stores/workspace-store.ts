@@ -70,6 +70,7 @@ interface WorkspaceState {
   setActiveCampaignGroup: (campaignGroupId: string) => void;
   openCampaignGroup: (campaignGroupId: string) => void;
   mergeCampaignGroupsIntoWorkspaceUnit: (sourceCampaignGroupId: string, targetCampaignGroupId: string) => void;
+  removeCampaignGroupFromWorkspaceUnit: (campaignGroupId: string) => void;
   setActiveWorkspaceUnit: (workspaceUnitId: string) => void;
   setActiveLifecycleGroup: (lifecycleGroupId?: LifecycleGroupId) => void;
   assignLifecycleGroup: (campaignGroupId: string, lifecycleGroupId: LifecycleGroupId) => void;
@@ -432,10 +433,10 @@ function buildWorkspaceUnitName(groups: CampaignGroup[]) {
   }
 
   if (groups.length === 1) {
-    return `${groups[0].campaignName} · Unit`;
+    return groups[0].adGroupName;
   }
 
-  return `${groups[0].campaignName} +${groups.length - 1} groups`;
+  return `${groups[0].adGroupName} +${groups.length - 1} 个分组`;
 }
 
 function upsertWorkspaceUnitForCampaign(
@@ -470,11 +471,29 @@ function upsertWorkspaceUnitForCampaign(
 
 function detachCampaignGroupFromWorkspaceUnits(workspaceUnits: WorkspaceUnit[], campaignGroupId: string) {
   return workspaceUnits
-    .map((unit) => ({
-      ...unit,
-      campaignGroupIds: unit.campaignGroupIds.filter((id) => id !== campaignGroupId),
-    }))
+    .map((unit) => {
+      const nextCampaignGroupIds = unit.campaignGroupIds.filter((id) => id !== campaignGroupId);
+
+      return {
+        ...unit,
+        campaignGroupIds: nextCampaignGroupIds,
+      };
+    })
     .filter((unit) => unit.campaignGroupIds.length > 0);
+}
+
+function rebuildWorkspaceUnits(workspaceUnits: WorkspaceUnit[], campaignGroups: CampaignGroup[]) {
+  return workspaceUnits
+    .map((unit) => {
+      const groups = campaignGroups.filter((group) => unit.campaignGroupIds.includes(group.id));
+
+      return {
+        ...unit,
+        name: buildWorkspaceUnitName(groups),
+        updatedAt: new Date().toISOString(),
+      };
+    })
+    .filter((unit) => unit.campaignGroupIds.length > 1);
 }
 
 function findWorkspaceUnitByCampaignGroupId(workspaceUnits: WorkspaceUnit[], campaignGroupId: string) {
@@ -753,6 +772,37 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
         activeLifecycleGroupId: undefined,
         workspaceMode: activeWorkspaceUnit ? "workspace-unit" : state.workspaceMode,
         openTabIds: Array.from(new Set([targetCampaignGroupId, sourceCampaignGroupId, ...state.openTabIds])).slice(0, 12),
+        adjustmentDrafts: [],
+        selectedDraftIds: [],
+      };
+    }),
+  removeCampaignGroupFromWorkspaceUnit: (campaignGroupId) =>
+    set((state) => {
+      const existingUnit = findWorkspaceUnitByCampaignGroupId(state.workspaceUnits, campaignGroupId);
+
+      if (!existingUnit) {
+        return state;
+      }
+
+      const workspaceUnits = rebuildWorkspaceUnits(
+        detachCampaignGroupFromWorkspaceUnits(state.workspaceUnits, campaignGroupId),
+        state.campaignGroups,
+      );
+      const nextActiveWorkspaceUnit =
+        state.activeWorkspaceUnitId && existingUnit.id === state.activeWorkspaceUnitId
+          ? workspaceUnits.find((unit) => unit.id === existingUnit.id)
+          : undefined;
+      const nextActiveCampaignGroupId =
+        nextActiveWorkspaceUnit?.campaignGroupIds[0] ??
+        (state.activeCampaignGroupId === campaignGroupId ? existingUnit.campaignGroupIds.find((id) => id !== campaignGroupId) : undefined) ??
+        state.activeCampaignGroupId;
+
+      return {
+        workspaceUnits,
+        activeWorkspaceUnitId: nextActiveWorkspaceUnit?.id,
+        activeCampaignGroupId: nextActiveCampaignGroupId,
+        workspaceMode: nextActiveWorkspaceUnit ? "workspace-unit" : "campaign",
+        openTabIds: state.openTabIds.filter((id) => id !== campaignGroupId),
         adjustmentDrafts: [],
         selectedDraftIds: [],
       };

@@ -269,7 +269,7 @@ export function WorkspacePanel() {
               </div>
               <Button variant="secondary" onClick={() => recentAdDataInputRef.current?.click()}>
                 <UploadCloud className="h-4 w-4" />
-                上传近期广告数据.csv
+                上传所有日期广告数据.csv
               </Button>
             </div>
             <div className="mt-3 grid gap-2 text-xs font-semibold text-muted sm:grid-cols-2 xl:grid-cols-6">
