@@ -1,8 +1,6 @@
 import type { PdfPageSummary, PdfSummary } from "@/lib/logistics/types";
 import { inferPdfMetaFromFileName } from "@/lib/logistics/utils";
-import { getDocument } from "pdfjs-dist";
 import { inflate } from "pako";
-import { recognize } from "tesseract.js";
 
 function escapeRegExp(value: string) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -95,112 +93,6 @@ function extractShipmentTitleFromStream(buffer: ArrayBuffer) {
   return "";
 }
 
-async function extractPdfText(buffer: ArrayBuffer) {
-  const fallbackText = decodePdfString(buffer);
-
-  try {
-    const loadingTask = getDocument({ data: buffer });
-    const pdf = await loadingTask.promise;
-    const pageTexts: string[] = [];
-
-    for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
-      const page = await pdf.getPage(pageNumber);
-      const content = await page.getTextContent();
-      const text = content.items
-        .map((item) => ("str" in item ? item.str : ""))
-        .filter(Boolean)
-        .join(" ");
-      pageTexts.push(text);
-    }
-
-    await loadingTask.destroy();
-    const extractedText = pageTexts.join("\n");
-    return [extractedText, fallbackText].filter((item) => item.trim()).join("\n");
-  } catch {
-    return fallbackText;
-  }
-}
-
-async function extractShipmentNameViaOcr(buffer: ArrayBuffer) {
-  const title = await extractShipmentTitleViaOcr(buffer);
-  const parsed = title ? parseShipmentTitle(title) : null;
-  return parsed?.shipmentName ?? "";
-}
-
-async function renderFirstPageCanvas(buffer: ArrayBuffer, scale = 3) {
-  if (typeof window === "undefined") {
-    return null;
-  }
-
-  try {
-    const loadingTask = getDocument({ data: buffer });
-    const pdf = await loadingTask.promise;
-    const page = await pdf.getPage(1);
-    const viewport = page.getViewport({ scale });
-    const canvas = document.createElement("canvas");
-    const context = canvas.getContext("2d");
-
-    if (!context) {
-      await loadingTask.destroy();
-      return null;
-    }
-
-    canvas.width = Math.ceil(viewport.width);
-    canvas.height = Math.ceil(viewport.height);
-
-    await page.render({
-      canvasContext: context,
-      viewport,
-    }).promise;
-    await loadingTask.destroy();
-
-    return canvas;
-  } catch {
-    return null;
-  }
-}
-
-function hasSuspiciousShipmentText(value: string) {
-  return /[�&〃廄拈]/u.test(value);
-}
-
-async function extractShipmentTitleViaOcr(buffer: ArrayBuffer) {
-  const canvas = await renderFirstPageCanvas(buffer, 4);
-  if (!canvas) {
-    return "";
-  }
-
-  const cropCanvas = document.createElement("canvas");
-  const cropContext = cropCanvas.getContext("2d");
-  if (!cropContext) {
-    return "";
-  }
-
-  const sourceX = Math.floor(canvas.width * 0.02);
-  const sourceY = Math.floor(canvas.height * 0.26);
-  const sourceWidth = Math.floor(canvas.width * 0.6);
-  const sourceHeight = Math.floor(canvas.height * 0.11);
-
-  cropCanvas.width = sourceWidth * 2;
-  cropCanvas.height = sourceHeight * 2;
-  cropContext.drawImage(
-    canvas,
-    sourceX,
-    sourceY,
-    sourceWidth,
-    sourceHeight,
-    0,
-    0,
-    cropCanvas.width,
-    cropCanvas.height,
-  );
-
-  const result = await recognize(cropCanvas, "chi_sim+eng");
-  const normalized = normalizePdfText(result.data.text).replace(/[—–]/g, "-");
-  const matched = normalized.match(/货件\d+-[A-Z]{3,5}\d*-FBA[A-Z0-9]+-\d+箱-[\u4e00-\u9fffA-Za-z0-9]+/u);
-  return matched?.[0] ?? "";
-}
-
 function matchFirst(text: string, pattern: RegExp) {
   const matched = text.match(pattern);
   return matched?.[1] ?? "";
@@ -214,28 +106,6 @@ function getPageCount(pdfText: string) {
   const matched = pdfText.match(/\/Count\s+(\d+)/);
   const parsed = matched ? Number(matched[1]) : null;
   return parsed && Number.isFinite(parsed) ? parsed : 1;
-}
-
-function extractShipmentNameToken(text: string) {
-  const patterns = [/(货件\s*\d+)/u, /(货\s*件\s*\d+)/u];
-
-  for (const pattern of patterns) {
-    const matched = text.match(pattern)?.[1];
-    if (matched) {
-      return matched.replace(/\s+/g, "");
-    }
-  }
-
-  return "";
-}
-
-function extractShipmentTitle(pdfText: string, fallbackName: string) {
-  const matched = findShipmentTitleInText(pdfText);
-  if (matched) {
-    return matched;
-  }
-
-  return inferPdfMetaFromFileName(fallbackName).shipmentTitle;
 }
 
 function parseShipmentTitle(titleText: string) {
@@ -257,15 +127,27 @@ function parseShipmentTitle(titleText: string) {
   };
 }
 
+function buildMetaFromShipmentTitle(titleText: string) {
+  const parsedTitle = parseShipmentTitle(titleText);
+  if (!parsedTitle) {
+    return null;
+  }
+
+  return {
+    shipmentTitle: titleText,
+    shipmentName: parsedTitle.shipmentName,
+    warehouseCode: parsedTitle.warehouseCode,
+    fbaCode: parsedTitle.fbaCode,
+    totalBoxes: parsedTitle.totalBoxes,
+    channelName: parsedTitle.channelName,
+  };
+}
+
 function extractGlobalMeta(pdfText: string, fallbackName: string) {
-  const normalizedText = normalizePdfText(pdfText);
-  const titleText = extractShipmentTitle(pdfText, fallbackName);
+  const titleText = findShipmentTitleInText(pdfText) || "";
   const parsedTitle = parseShipmentTitle(titleText);
 
-  const shipmentName =
-    parsedTitle?.shipmentName ||
-    extractShipmentNameToken(normalizedText) ||
-    matchFirst(pdfText, /(货件\d+)/u);
+  const shipmentName = parsedTitle?.shipmentName || "";
 
   const fbaBoxCodes = Array.from(pdfText.matchAll(/(FBA[A-Z0-9]+U\d{6})/g)).map((item) => item[1]);
   const firstFbaBoxCode = fbaBoxCodes[0] ?? "";
@@ -285,11 +167,11 @@ function extractGlobalMeta(pdfText: string, fallbackName: string) {
   const channelNameFromTitle = parsedTitle?.channelName ?? "";
 
   const fallbackMeta = inferPdfMetaFromFileName(fallbackName);
-  const resolvedShipmentName = shipmentName || fallbackMeta.shipmentName;
+  const resolvedShipmentName = shipmentName;
   const resolvedWarehouseCode = warehouseCode || fallbackMeta.warehouseCode;
   const resolvedFbaCode = fbaCode || fallbackMeta.fbaCode;
   const resolvedTotalBoxes = titleBoxCount ?? fallbackMeta.totalBoxes;
-  const resolvedChannelName = channelNameFromTitle || fallbackMeta.channelName;
+  const resolvedChannelName = channelNameFromTitle;
   const resolvedShipmentTitle = [
     resolvedShipmentName,
     resolvedWarehouseCode,
@@ -355,21 +237,11 @@ function extractPageSummaries(
 export async function parsePdfFile(file: File): Promise<PdfSummary> {
   const buffer = await file.arrayBuffer();
   const streamShipmentTitle = extractShipmentTitleFromStream(buffer);
-  const pdfText = await extractPdfText(buffer);
+  const pdfText = decodePdfString(buffer);
   const parsedPageCount = getPageCount(pdfText);
-  let sharedMeta = extractGlobalMeta(streamShipmentTitle ? `${streamShipmentTitle}\n${pdfText}` : pdfText, file.name);
-
-  if ((!sharedMeta.shipmentName || hasSuspiciousShipmentText(sharedMeta.shipmentTitle) || hasSuspiciousShipmentText(sharedMeta.channelName)) && !streamShipmentTitle) {
-    const shipmentTitleFromOcr = await extractShipmentTitleViaOcr(buffer);
-    if (shipmentTitleFromOcr) {
-      sharedMeta = extractGlobalMeta(`${shipmentTitleFromOcr}\n${pdfText}`, file.name);
-    } else if (!sharedMeta.shipmentName) {
-      const shipmentNameFromOcr = await extractShipmentNameViaOcr(buffer);
-      if (shipmentNameFromOcr) {
-        sharedMeta = extractGlobalMeta(`${shipmentNameFromOcr}\n${pdfText}`, file.name);
-      }
-    }
-  }
+  const sharedMeta =
+    (streamShipmentTitle ? buildMetaFromShipmentTitle(streamShipmentTitle) : null) ??
+    extractGlobalMeta(pdfText, file.name);
 
   const pageCount = sharedMeta.totalBoxes && Number.isFinite(sharedMeta.totalBoxes) ? sharedMeta.totalBoxes : parsedPageCount;
   const pages = extractPageSummaries(pdfText, sharedMeta, pageCount);
