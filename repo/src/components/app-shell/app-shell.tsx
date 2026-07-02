@@ -2,13 +2,14 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { BarChart3, Bot, Gauge, Home, Settings, SlidersHorizontal, UploadCloud } from "lucide-react";
+import { BarChart3, Bot, Gauge, Home, PackageSearch, Settings, SlidersHorizontal, UploadCloud } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 const navItems = [
   { href: "/", label: "Home", icon: Home },
   { href: "/dashboard", label: "Dashboard", icon: Gauge },
   { href: "/workspace", label: "Workspace", icon: UploadCloud },
+  { href: "/logistics", label: "Logistics", icon: PackageSearch },
   { href: "/rules", label: "Rules", icon: SlidersHorizontal },
   { href: "/settings", label: "Settings", icon: Settings },
 ];

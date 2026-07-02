@@ -7,12 +7,10 @@ import { AdjustmentTable } from "@/components/workspace/adjustment-table";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { defaultRules, lifecycleGroups } from "@/data/mock-data";
-import { useBulkUpload } from "@/lib/hooks/use-bulk-upload";
 import { useWorkspaceStore } from "@/lib/stores/workspace-store";
 import { workspacePanelAnchorId } from "@/lib/workspace-events";
 
 export function WorkspacePanel() {
-  const { fileInputRef, handleFileSelected } = useBulkUpload();
   const recentAdDataInputRef = useRef<HTMLInputElement>(null);
   const {
     campaignGroups,
@@ -25,12 +23,6 @@ export function WorkspacePanel() {
     setActiveCampaignGroup,
     openCampaignGroup,
     setActiveWorkspaceUnit,
-    parseStatus,
-    parseProgress,
-    uploadedFileName,
-    parsedRowCount,
-    parsedSheets,
-    parseError,
     recentAdDataFileName,
     recentAdDataStatus,
     recentAdDataError,
@@ -143,22 +135,15 @@ export function WorkspacePanel() {
           </div>
           <div>
             <input
-              ref={fileInputRef}
-              type="file"
-              accept=".xlsx,.xls,.xlsm,.csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel,text/csv"
-              className="hidden"
-              onChange={(event) => void handleFileSelected(event.target.files?.[0])}
-            />
-            <input
               ref={recentAdDataInputRef}
               type="file"
               accept=".csv,text/csv"
               className="hidden"
               onChange={(event) => void handleRecentAdDataSelected(event.target.files?.[0])}
             />
-            <Button onClick={() => fileInputRef.current?.click()} disabled={parseStatus === "parsing"}>
+            <Button onClick={() => recentAdDataInputRef.current?.click()}>
               <UploadCloud className="h-4 w-4" />
-              上传 Bulk 文件
+              上传所有日期广告数据.csv
             </Button>
           </div>
         </CardHeader>
@@ -166,7 +151,7 @@ export function WorkspacePanel() {
           <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-border bg-white px-4 py-3">
             <div className="text-xs font-semibold text-muted">
               <span className={persistenceStatus === "failed" ? "text-danger" : "text-success"}>{persistenceLabel}</span>
-              <span className="ml-2">刷新页面后会自动恢复 Bulk 解析结果、生命周期分组、近期广告数据和草稿勾选。</span>
+              <span className="ml-2">刷新页面后会自动恢复生命周期分组、近期广告数据和草稿勾选。</span>
               {persistenceError && <span className="ml-2 text-danger">{persistenceError}</span>}
             </div>
             <Button
@@ -220,43 +205,6 @@ export function WorkspacePanel() {
                   </Button>
                 )}
               </div>
-            </div>
-          </div>
-          <div className="rounded-lg border border-dashed border-brand/40 bg-blue-50 p-4">
-            <div className="flex flex-wrap items-center justify-between gap-3">
-              <div>
-                <p className="text-sm font-bold text-foreground">大文件异步解析队列</p>
-                <p className="text-xs font-medium text-muted">
-                  Sheet 一级标签 / 广告组子标签 / 原始行号定位 / Worker 分块解析
-                </p>
-              </div>
-              <span className="text-sm font-bold text-brand">
-                {parseStatus === "idle" ? "等待上传" : parseStatus === "failed" ? "解析失败" : `${parseProgress}%`}
-              </span>
-            </div>
-            <div className="mt-3 h-2 overflow-hidden rounded-full bg-white">
-              <div className="h-full rounded-full bg-brand transition-all" style={{ width: `${parseProgress}%` }} />
-            </div>
-            <div className="mt-3 flex flex-wrap items-center gap-3 text-xs font-semibold text-muted">
-              {uploadedFileName && (
-                <span className="inline-flex items-center gap-1">
-                  <FileSpreadsheet className="h-4 w-4 text-brand" />
-                  {uploadedFileName}
-                </span>
-              )}
-              {parseStatus === "completed" && (
-                <span className="inline-flex items-center gap-1 text-success">
-                  <CheckCircle2 className="h-4 w-4" />
-                  已解析 {parsedRowCount.toLocaleString("zh-CN")} 行
-                </span>
-              )}
-              {parsedSheets.length > 0 && <span>Sheet: {parsedSheets.join("、")}</span>}
-              {parseError && (
-                <span className="inline-flex items-center gap-1 text-danger">
-                  <AlertCircle className="h-4 w-4" />
-                  {parseError}
-                </span>
-              )}
             </div>
           </div>
           <div className="rounded-lg border border-border bg-white p-4">
