@@ -8,6 +8,7 @@ import {
   Eye,
   FileSpreadsheet,
   FileText,
+  FileArchive,
   Package,
   RefreshCw,
   UploadCloud,
@@ -189,6 +190,50 @@ export function LogisticsWorkbench() {
     }
   };
 
+  const handleDownloadRenamedPdf = async (index?: number) => {
+    const files = rawFiles.pdf ?? [];
+    if (!files.length || !state.pdfSummaries.length) {
+      pushLog({ level: "warning", message: "请先上传 PDF 文件" });
+      return;
+    }
+
+    if (typeof index === "number") {
+      const file = files[index];
+      const summary = state.pdfSummaries[index];
+      if (!file || !summary) {
+        pushLog({ level: "warning", message: "未找到对应 PDF" });
+        return;
+      }
+      downloadBlob(file, summary.renamedFileName);
+      return;
+    }
+
+    const firstFile = files[0];
+    const firstSummary = state.pdfSummaries[0];
+    if (firstFile && firstSummary) {
+      downloadBlob(firstFile, firstSummary.renamedFileName);
+    }
+  };
+
+  const handleDownloadInvoiceTemplate = async (index?: number) => {
+    const dFile = rawFiles.d;
+    if (!dFile) {
+      pushLog({ level: "warning", message: "请先上传物流模板 D" });
+      return;
+    }
+
+    const targetSummary = typeof index === "number" ? state.pdfSummaries[index] : state.pdfSummaries[0];
+    const baseName = targetSummary
+      ? `${targetSummary.shipmentName || "货件"}-${targetSummary.warehouseCode || "仓库"}-${targetSummary.fbaCode || "FBA"}-物流发票.xlsx`
+      : `物流发票模板_${Date.now()}.xlsx`;
+
+    const buffer = await dFile.arrayBuffer();
+    downloadBlob(
+      new Blob([buffer], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }),
+      baseName,
+    );
+  };
+
   const taskSummary = useMemo(() => {
     const primaryPdfSummary = state.pdfSummaries[0] ?? null;
 
@@ -249,11 +294,12 @@ export function LogisticsWorkbench() {
             title="包装箱表 C"
             description="按 SKU 和箱号自动回填数量、重量、尺寸"
             file={state.cFile}
-            status={state.cSummary ? ["箱数", String(state.cSummary.totalBoxes)] : undefined}
+            status={state.cExport ? ["已生成", state.cExport.fileName] : state.cSummary ? ["箱数", String(state.cSummary.totalBoxes)] : undefined}
             actionLabel="生成 C 表"
             actionDisabled={!state.aSummary || !rawFiles.c}
             onAction={handleBuildC}
             downloadLabel="下载 C 表"
+            downloadDisabled={!state.cExport}
             onDownload={() => downloadExport("cExport")}
             onSelect={(file) => handleFileUpload("c", file)}
           />
@@ -262,6 +308,8 @@ export function LogisticsWorkbench() {
             description="读取货件号、仓库、FBA 编号、箱数"
             files={state.pdfFiles}
             status={state.pdfSummaries.length ? ["票数", String(state.pdfSummaries.length)] : undefined}
+            downloadLabel="下载箱唛"
+            onDownload={() => handleDownloadRenamedPdf()}
             onSelectMany={(files) => handlePdfUploads(files)}
             multiple
           />
@@ -270,6 +318,8 @@ export function LogisticsWorkbench() {
             description="识别物流发票模板与 FBA 仓库地址表"
             file={state.dFile}
             status={state.dSummary ? ["主模板", state.dSummary.templateSheetName || "未知"] : undefined}
+            downloadLabel="下载发票"
+            onDownload={() => handleDownloadInvoiceTemplate()}
             onSelect={(file) => handleFileUpload("d", file)}
           />
         </section>
@@ -292,17 +342,60 @@ export function LogisticsWorkbench() {
                 </Button>
               </div>
             </CardHeader>
-            <CardContent className="grid gap-4 md:grid-cols-4">
-              <MetricCard label="货件号" value={taskSummary.shipmentName} />
-              <MetricCard label="仓库名称" value={taskSummary.warehouseCode} />
-              <MetricCard label="FBA编号" value={taskSummary.fbaCode} />
-              <MetricCard label="总箱数" value={formatMetricNumber(taskSummary.boxCount)} />
-              <MetricCard label="SKU数" value={formatMetricNumber(taskSummary.skuCount)} />
-              <MetricCard label="发货总数" value={formatMetricNumber(taskSummary.totalShipment)} />
-              <MetricCard label="PDF票数" value={formatMetricNumber(taskSummary.pdfCount)} />
-              <MetricCard label="PDF页数" value={formatMetricNumber(taskSummary.pdfPageCount)} />
-              <MetricCard label="警告数" value={formatMetricNumber(taskSummary.warningCount)} />
-              <MetricCard label="错误数" value={formatMetricNumber(taskSummary.errorCount)} />
+            <CardContent className="space-y-4">
+              <div className="overflow-x-auto">
+                <table className="min-w-full text-left text-sm">
+                  <thead>
+                    <tr className="border-b border-border text-muted">
+                      <th className="px-3 py-2">货件号</th>
+                      <th className="px-3 py-2">仓库</th>
+                      <th className="px-3 py-2">FBA编号</th>
+                      <th className="px-3 py-2">箱数</th>
+                      <th className="px-3 py-2">页数</th>
+                      <th className="px-3 py-2">渠道</th>
+                      <th className="px-3 py-2">操作</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {state.pdfSummaries.map((item, index) => (
+                      <tr key={`${item.fileNameBase}-${index}`} className="border-b border-border/70">
+                        <td className="px-3 py-3 font-semibold">{item.shipmentName || "--"}</td>
+                        <td className="px-3 py-3">{item.warehouseCode || "--"}</td>
+                        <td className="px-3 py-3">{item.fbaCode || "--"}</td>
+                        <td className="px-3 py-3">{formatMetricNumber(item.totalBoxes)}</td>
+                        <td className="px-3 py-3">{formatMetricNumber(item.pages.length)}</td>
+                        <td className="px-3 py-3">{item.channelName || "--"}</td>
+                        <td className="px-3 py-3">
+                          <div className="flex flex-wrap gap-2">
+                            <Button size="sm" variant="secondary" onClick={() => handleDownloadRenamedPdf(index)}>
+                              <FileArchive className="h-4 w-4" />
+                              下载箱唛
+                            </Button>
+                            <Button size="sm" onClick={() => handleDownloadInvoiceTemplate(index)}>
+                              <Download className="h-4 w-4" />
+                              下载发票
+                            </Button>
+                          </div>
+                        </td>
+                      </tr>
+                    ))}
+                    {!state.pdfSummaries.length && (
+                      <tr>
+                        <td colSpan={7} className="px-3 py-8 text-center text-muted">
+                          上传 PDF 后，这里会按每个货件逐条展示
+                        </td>
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+              <div className="grid gap-4 md:grid-cols-3 xl:grid-cols-5">
+                <MetricCard label="默认货件号" value={taskSummary.shipmentName} />
+                <MetricCard label="SKU数" value={formatMetricNumber(taskSummary.skuCount)} />
+                <MetricCard label="发货总数" value={formatMetricNumber(taskSummary.totalShipment)} />
+                <MetricCard label="PDF票数" value={formatMetricNumber(taskSummary.pdfCount)} />
+                <MetricCard label="PDF页数" value={formatMetricNumber(taskSummary.pdfPageCount)} />
+              </div>
             </CardContent>
           </Card>
 
@@ -470,6 +563,7 @@ function UploadCard({
   actionLabel,
   actionDisabled,
   downloadLabel,
+  downloadDisabled,
   onSelect,
   onSelectMany,
   onAction,
@@ -488,9 +582,12 @@ function UploadCard({
   onSelectMany?: (files: File[]) => void;
   onAction?: () => void;
   onDownload?: () => void;
+  downloadDisabled?: boolean;
   multiple?: boolean;
 }) {
-  const currentFileLabel = multiple ? `${files?.length ?? 0} 个文件` : (file?.name ?? "支持 Excel / PDF");
+  const currentFileLabel = multiple
+    ? (files?.length ? `${files.length} 个文件已上传` : "支持一次选择多个 PDF")
+    : (file?.name ?? "支持 Excel / PDF");
   const uploadLabel = multiple ? (files?.length ? "重新上传多个文件" : "点击上传多个文件") : (file ? "重新上传文件" : "点击上传文件");
 
   return (
@@ -503,7 +600,7 @@ function UploadCard({
         <label className="mt-4 flex flex-1 cursor-pointer flex-col items-center justify-center rounded-lg border border-dashed border-border bg-surface-muted px-4 text-center transition-colors hover:border-brand hover:bg-white">
           <UploadCloud className="h-8 w-8 text-brand" />
           <span className="mt-3 text-sm font-semibold text-foreground">{uploadLabel}</span>
-          <span className="mt-1 text-xs text-muted">{currentFileLabel}</span>
+          <span className="mt-1 line-clamp-2 max-w-full overflow-hidden text-ellipsis break-all text-xs text-muted">{currentFileLabel}</span>
           <input
             type="file"
             className="hidden"
@@ -540,7 +637,7 @@ function UploadCard({
               </Button>
             ) : null}
             {onDownload && downloadLabel ? (
-              <Button size="sm" onClick={onDownload}>
+              <Button size="sm" onClick={onDownload} disabled={downloadDisabled}>
                 <Download className="h-4 w-4" />
                 {downloadLabel}
               </Button>

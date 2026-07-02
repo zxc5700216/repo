@@ -216,14 +216,14 @@ export async function buildCWorkbook(file: File, aSummary: AWorkbookSummary): Pr
 
     for (const [boxNoText, qty] of Object.entries(product.boxMap)) {
       const boxNo = Number(boxNoText);
-      const colIndex = 7 + boxNo;
+      const colIndex = 6 + boxNo;
       XLSX.utils.sheet_add_aoa(sheet, [[qty]], { origin: { r: sheetRowIndex, c: colIndex } });
     }
   });
 
   aSummary.boxHeaders.forEach((boxNo) => {
     const weightLb = Number(((aSummary.boxWeightKgMap[boxNo] ?? 0) / 0.454).toFixed(2));
-    const colIndex = 7 + boxNo;
+    const colIndex = 6 + boxNo;
     XLSX.utils.sheet_add_aoa(sheet, [[weightLb]], { origin: { r: 14, c: colIndex } });
     XLSX.utils.sheet_add_aoa(sheet, [[17]], { origin: { r: 15, c: colIndex } });
     XLSX.utils.sheet_add_aoa(sheet, [[18]], { origin: { r: 16, c: colIndex } });
