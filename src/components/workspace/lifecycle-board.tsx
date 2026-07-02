@@ -36,7 +36,7 @@ export function LifecycleBoard() {
   }
 
   return (
-    <div className="grid grid-cols-1 gap-3 xl:grid-cols-4">
+    <div className="grid grid-cols-1 gap-3">
       {lifecycleGroups.map((group) => {
         const assignedGroups = campaignGroups.filter((item) => item.lifecycleGroupId === group.id);
         const rules = defaultRules.filter((rule) => rule.lifecycleGroupId === group.id && rule.enabled);
@@ -54,7 +54,7 @@ export function LifecycleBoard() {
             }}
             onDragLeave={() => setDragOverGroupId(null)}
             onDrop={(event) => assignDraggedGroup(event, group.id)}
-            className={`min-h-[230px] rounded-lg border bg-white p-4 shadow-sm transition-colors ${
+            className={`min-h-[210px] rounded-lg border bg-white p-4 shadow-sm transition-colors ${
               isDragOver || isActiveLifecycle ? "border-brand bg-blue-50" : "border-border"
             }`}
           >

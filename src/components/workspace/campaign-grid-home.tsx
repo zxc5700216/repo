@@ -1,4 +1,4 @@
-"use client";
+﻿"use client";
 
 import { ArrowUpRight, RotateCcw, Search, SlidersHorizontal, UploadCloud } from "lucide-react";
 import { useDeferredValue, useEffect, useMemo, useState } from "react";
@@ -10,6 +10,7 @@ import { workspacePanelAnchorId } from "@/lib/workspace-events";
 import type { PerformanceRow } from "@/lib/types";
 
 const pageSize = 16;
+const detailPageSize = 25;
 const dragMimeType = "application/x-campaign-group-id";
 
 type PageItem = number | "...";
@@ -24,8 +25,6 @@ type DetailSortKey =
   | "orders"
   | "sales"
   | "spend";
-
-const detailPageSize = 25;
 
 function buildPageItems(currentPage: number, totalPages: number) {
   if (totalPages <= 7) {
@@ -64,6 +63,7 @@ export function CampaignGridHome() {
     removeCampaignGroupFromWorkspaceUnit,
     setActiveWorkspaceUnit,
   } = useWorkspaceStore();
+
   const groupedCampaignIds = useMemo(
     () => new Set(workspaceUnits.flatMap((unit) => unit.campaignGroupIds)),
     [workspaceUnits],
@@ -83,9 +83,11 @@ export function CampaignGridHome() {
       }),
     [activeLifecycleGroupId, campaignGroups, groupedCampaignIds, query, workspaceUnits],
   );
+
   const totalPages = Math.max(1, Math.ceil(filteredCampaigns.length / pageSize));
   const pagedCampaigns = filteredCampaigns.slice((page - 1) * pageSize, page * pageSize);
   const pageItems = buildPageItems(page, totalPages);
+
   const detailRows = useMemo(
     () =>
       detailCampaignGroupIds
@@ -93,6 +95,7 @@ export function CampaignGridHome() {
         : [],
     [detailCampaignGroupIds, performanceRows],
   );
+
   const filteredDetailRows = useMemo(() => {
     const normalizedQuery = deferredDetailQuery.trim().toLowerCase();
 
@@ -101,19 +104,13 @@ export function CampaignGridHome() {
     }
 
     return detailRows.filter((row) =>
-      [
-        row.sheetName ?? "",
-        row.adGroupName,
-        row.keyword,
-        row.matchType,
-        row.target,
-        row.status,
-      ]
+      [row.sheetName ?? "", row.adGroupName, row.keyword, row.matchType, row.target, row.status]
         .join(" ")
         .toLowerCase()
         .includes(normalizedQuery),
     );
   }, [deferredDetailQuery, detailRows]);
+
   const sortedDetailRows = useMemo(() => {
     const rows = [...filteredDetailRows];
 
@@ -123,13 +120,17 @@ export function CampaignGridHome() {
       const comparison =
         typeof leftRaw === "number" && typeof rightRaw === "number"
           ? leftRaw - rightRaw
-          : (leftRaw ?? "").toString().toLowerCase().localeCompare((rightRaw ?? "").toString().toLowerCase(), "zh-CN");
+          : (leftRaw ?? "")
+              .toString()
+              .toLowerCase()
+              .localeCompare((rightRaw ?? "").toString().toLowerCase(), "zh-CN");
 
       return detailSortDirection === "asc" ? comparison : -comparison;
     });
 
     return rows;
   }, [detailSortDirection, detailSortKey, filteredDetailRows]);
+
   const detailTotalPages = Math.max(1, Math.ceil(sortedDetailRows.length / detailPageSize));
   const detailPageItems = buildPageItems(detailPage, detailTotalPages);
   const detailRowsPreview = sortedDetailRows.slice((detailPage - 1) * detailPageSize, detailPage * detailPageSize);
@@ -198,7 +199,11 @@ export function CampaignGridHome() {
     }
 
     setDetailSortKey(sortKey);
-    setDetailSortDirection(sortKey === "keyword" || sortKey === "adGroupName" || sortKey === "sheetName" || sortKey === "matchType" ? "asc" : "desc");
+    setDetailSortDirection(
+      sortKey === "keyword" || sortKey === "adGroupName" || sortKey === "sheetName" || sortKey === "matchType"
+        ? "asc"
+        : "desc",
+    );
   }
 
   function renderMetricCell(value: string | number, align: "left" | "right" = "left") {
@@ -215,7 +220,7 @@ export function CampaignGridHome() {
           type="button"
           onClick={() => toggleDetailSort(sortKey)}
           className={`inline-flex items-center gap-1 transition-colors ${active ? "text-brand" : "hover:text-foreground"}`}
-          title={`按${label}排序`}
+          title={`Sort by ${label}`}
         >
           <span>{label}</span>
           <span className="min-w-3 text-[11px]">{arrow}</span>
@@ -330,31 +335,31 @@ export function CampaignGridHome() {
                 }
               }}
               onKeyDown={(event) => handleCardKeyDown(event, campaign.id, workspaceUnit?.id)}
-              className={`rounded-2xl border p-5 text-left transition-all ${
+              className={`rounded-2xl border p-4 text-left transition-all ${
                 active ? "border-brand bg-white shadow-[0_12px_30px_rgba(23,107,135,0.12)]" : "border-border bg-white hover:-translate-y-0.5"
               }`}
             >
               <div className="flex items-start justify-between gap-3">
                 <div className="min-w-0">
-                  <p className="truncate text-sm font-black uppercase tracking-[0.12em] text-muted">
+                  <p className="truncate text-xs font-black uppercase tracking-[0.12em] text-muted">
                     {campaign.sheetName ?? "Bulk"}
                   </p>
-                  <h3 className="mt-2 line-clamp-2 text-lg font-bold text-foreground">
+                  <h3 className="mt-1.5 line-clamp-2 text-[15px] font-bold leading-6 text-foreground">
                     {workspaceUnit ? workspaceUnit.name : campaign.adGroupName}
                   </h3>
-                  <p className="mt-1 truncate text-sm text-muted">{campaign.campaignName}</p>
+                  <p className="mt-1 truncate text-xs text-muted">{campaign.campaignName}</p>
                 </div>
                 <ArrowUpRight className={`h-5 w-5 shrink-0 ${active ? "text-brand" : "text-muted"}`} />
               </div>
 
-              <div className="mt-4 flex items-center gap-2">
+              <div className="mt-3 flex items-center gap-2">
                 <Badge tone={campaign.lifecycleGroupId === "mature" ? "green" : campaign.lifecycleGroupId === "decline" ? "amber" : campaign.lifecycleGroupId === "clearance" ? "red" : "blue"}>
                   {campaign.lifecycleGroupId ?? "unassigned"}
                 </Badge>
                 <span className="text-xs font-semibold text-muted">Updated {campaign.lastUpdated}</span>
               </div>
 
-              <div className={`mt-5 grid gap-3 rounded-xl bg-surface-muted p-3 ${splitLayout}`}>
+              <div className={`mt-3 grid gap-2 rounded-xl bg-surface-muted p-2.5 ${splitLayout}`}>
                 {tileCampaigns.map((tileCampaign) => (
                   <div
                     key={tileCampaign.id}
@@ -364,7 +369,7 @@ export function CampaignGridHome() {
                       event.dataTransfer.setData(dragMimeType, tileCampaign.id);
                       event.dataTransfer.effectAllowed = "move";
                     }}
-                    className="rounded-lg bg-white/80 p-3"
+                    className="rounded-lg bg-white/80 p-2.5"
                   >
                     <div className="flex items-start justify-between gap-2">
                       <p className="truncate text-xs font-bold text-muted">{tileCampaign.adGroupName}</p>
@@ -376,14 +381,14 @@ export function CampaignGridHome() {
                             removeCampaignGroupFromWorkspaceUnit(tileCampaign.id);
                           }}
                           className="inline-flex shrink-0 items-center gap-1 rounded-full border border-border bg-white px-2 py-1 text-[10px] font-semibold text-muted transition-colors hover:border-brand hover:text-brand"
-                          title={`将 ${tileCampaign.adGroupName} 撤出分组`}
+                          title={`Move ${tileCampaign.adGroupName} out of this workspace`}
                         >
                           <RotateCcw className="h-3 w-3" />
-                          撤回
+                          Undo
                         </button>
                       ) : null}
                     </div>
-                    <p className="mt-2 text-lg font-black text-foreground">{tileCampaign.keywordCount.toLocaleString("zh-CN")}</p>
+                    <p className="mt-1.5 text-[15px] font-black text-foreground">{tileCampaign.keywordCount.toLocaleString("zh-CN")}</p>
                   </div>
                 ))}
               </div>
@@ -396,16 +401,16 @@ export function CampaignGridHome() {
                     openDetailRows(event, tileCampaigns.map((group) => group.id));
                   }
                 }}
-                className="mt-3 grid w-full grid-cols-2 gap-3 rounded-xl bg-surface-muted p-3 text-left transition-colors hover:bg-blue-50"
-                title="查看已读取数据详情"
+                className="mt-2.5 grid w-full grid-cols-2 gap-2 rounded-xl bg-surface-muted p-2.5 text-left transition-colors hover:bg-blue-50"
+                title="View parsed keyword details"
               >
                 <div>
                   <p className="text-[11px] font-bold uppercase tracking-[0.08em] text-muted">Keywords</p>
-                  <p className="mt-1 text-xl font-black text-foreground">{keywordCount.toLocaleString("zh-CN")}</p>
+                  <p className="mt-1 text-[15px] font-black text-foreground">{keywordCount.toLocaleString("zh-CN")}</p>
                 </div>
                 <div>
                   <p className="text-[11px] font-bold uppercase tracking-[0.08em] text-muted">Workspace</p>
-                  <p className="mt-1 text-sm font-bold text-foreground">{workspaceUnit ? `${tileCampaigns.length} 个分组` : "Open"}</p>
+                  <p className="mt-1 text-[15px] font-bold text-foreground">{workspaceUnit ? `${tileCampaigns.length} groups` : "Open"}</p>
                 </div>
               </button>
             </div>
@@ -424,9 +429,9 @@ export function CampaignGridHome() {
           >
             <div className="flex items-center justify-between gap-4 border-b border-border px-5 py-4">
               <div>
-                <h3 className="text-lg font-bold text-foreground">已读取数据详情</h3>
+                <h3 className="text-lg font-bold text-foreground">Parsed Keyword Details</h3>
                 <p className="mt-1 text-sm text-muted">
-                  共 {detailRows.length.toLocaleString("zh-CN")} 条，筛选后 {sortedDetailRows.length.toLocaleString("zh-CN")} 条，第 {detailPage} / {detailTotalPages} 页
+                  Total {detailRows.length.toLocaleString("zh-CN")} rows, filtered to {sortedDetailRows.length.toLocaleString("zh-CN")} rows, page {detailPage} / {detailTotalPages}
                 </p>
               </div>
               <div className="flex flex-wrap items-center justify-end gap-3">
@@ -435,7 +440,7 @@ export function CampaignGridHome() {
                   <input
                     value={detailQuery}
                     onChange={(event) => setDetailQuery(event.target.value)}
-                    placeholder="搜索关键词、广告组、Sheet、匹配类型"
+                    placeholder="Search keyword, ad group, sheet, or match type"
                     className="min-w-0 flex-1 bg-transparent text-sm outline-none"
                   />
                 </div>
@@ -448,7 +453,7 @@ export function CampaignGridHome() {
                   <option value="desc">Z-A</option>
                 </select>
                 <Button variant="secondary" onClick={closeDetailRows}>
-                  关闭
+                  Close
                 </Button>
                 <div className="flex flex-wrap items-center gap-2">
                   {detailPageItems.map((item, index) =>
@@ -478,23 +483,25 @@ export function CampaignGridHome() {
             </div>
             <div className="thin-scrollbar max-h-[calc(85vh-88px)] overflow-auto">
               {detailRows.length === 0 ? (
-                <div className="px-5 py-12 text-center text-sm font-medium text-muted">当前卡片还没有已解析的关键词数据。</div>
+                <div className="px-5 py-12 text-center text-sm font-medium text-muted">
+                  No parsed keyword rows are available for this card yet.
+                </div>
               ) : (
                 <>
                   <table className="w-full min-w-[1200px] text-sm">
                     <thead className="sticky top-0 bg-surface-muted text-xs font-bold text-muted">
                       <tr>
                         {renderSortableHeader("Sheet", "sheetName")}
-                        {renderSortableHeader("广告组", "adGroupName")}
-                        {renderSortableHeader("关键词", "keyword")}
-                        {renderSortableHeader("匹配类型", "matchType")}
+                        {renderSortableHeader("Ad Group", "adGroupName")}
+                        {renderSortableHeader("Keyword", "keyword")}
+                        {renderSortableHeader("Match Type", "matchType")}
                         {renderSortableHeader("Bid", "currentBid", "right")}
                         {renderSortableHeader("Impr.", "impressions", "right")}
                         {renderSortableHeader("Clicks", "clicks", "right")}
                         {renderSortableHeader("Orders", "orders", "right")}
                         {renderSortableHeader("Sales", "sales", "right")}
                         {renderSortableHeader("Spend", "spend", "right")}
-                        <th className="px-3 py-3 text-left">状态</th>
+                        <th className="px-3 py-3 text-left">Status</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-border">
@@ -510,16 +517,16 @@ export function CampaignGridHome() {
                           {renderMetricCell(row.orders.toLocaleString("zh-CN"), "right")}
                           {renderMetricCell(row.sales.toFixed(2), "right")}
                           {renderMetricCell(row.spend.toFixed(2), "right")}
-                          {renderMetricCell(row.status === "paused" ? "暂停" : "启用")}
+                          {renderMetricCell(row.status === "paused" ? "Paused" : "Enabled")}
                         </tr>
                       ))}
                     </tbody>
                   </table>
                   <div className="flex flex-wrap items-center justify-between gap-3 border-t border-border px-5 py-4">
                     <p className="text-sm font-medium text-muted">
-                      当前显示 {detailRowsPreview.length.toLocaleString("zh-CN")} 条
+                      Showing {detailRowsPreview.length.toLocaleString("zh-CN")} rows on this page
                     </p>
-                    <p className="text-sm font-medium text-muted">分页已移到顶部右侧</p>
+                    <p className="text-sm font-medium text-muted">Pagination is pinned to the top-right of the modal</p>
                   </div>
                 </>
               )}
@@ -530,7 +537,7 @@ export function CampaignGridHome() {
 
       {pagedCampaigns.length === 0 && (
         <div className="rounded-xl border border-dashed border-border bg-white px-5 py-10 text-center text-sm font-medium text-muted">
-          当前筛选条件下没有可展示的广告组。
+          No campaign groups match the current filters.
         </div>
       )}
     </section>
